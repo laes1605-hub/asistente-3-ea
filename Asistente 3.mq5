@@ -16,6 +16,9 @@ input group "=== GESTIÓN AVANZADA 1:2 ==="
 input double InpActivationPoints = 210;
 input double InpProtectedSL      = 205;
 input bool   InpAutoFromLevel5   = true;
+input bool InpEnableAdvanced=true;
+input bool InpFridayCloseEnabled=true;
+input int InpFridayCloseMinutes=30;
 
 input group "=== LOTAJES POR NIVEL ==="
 input double InpLotStep1   = 0.01;
@@ -42,6 +45,7 @@ input double InpLotStep20  = 24.14;
 input group "=== SPLIT DE LOTES ==="
 input double InpMaxLotsPerOrder  = 100.0;
 input int    InpSplitDelayMs     = 200;
+input int    InpActiveLevels     = 20; // cantidad visible y utilizable de niveles (1-20)
 
 input group "=== CONFIGURACIÓN ==="
 input int    InpPanelX      = 20;
@@ -52,7 +56,7 @@ input string InpComment     = "QA_EA";
 //+------------------------------------------------------------------+
 //| CONSTANTES                                                       |
 //+------------------------------------------------------------------+
-#define PNL_W        320
+#define PNL_W        360
 #define PNL_H        530
 #define TAB_H        28
 #define CONTENT_Y0   96
@@ -111,7 +115,8 @@ double      TP_Points;
 double      Activation_Points;
 double      Protected_SL;
 double      g_LimitPrice   = 0.0;
-bool        g_AdvancedMode = false;
+bool g_AdvancedMode=false;
+datetime g_LastFridayClose=0;
 
 TradeRecord g_Trades[];
 int         g_TradeCount   = 0;
@@ -346,7 +351,7 @@ void ReadCommandsFromFile()
    
    // ── Parsear Step ─────────────────────────────
    double newStep = ExtractJsonDouble(content, "set_step");
-   if(newStep >= 1 && newStep <= 20 && (int)newStep != CurrentStep)
+   if(newStep >= 1 && newStep <= InpActiveLevels && (int)newStep != CurrentStep)
    {
       CurrentStep = (int)newStep;
       Print("📱 Dashboard cambió Nivel a: ", CurrentStep);
@@ -469,7 +474,7 @@ void LoadState()
    if(GlobalVariableCheck(GV_STEP))
    {
       int saved = (int)GlobalVariableGet(GV_STEP);
-      if(saved >= 1 && saved <= 20)
+      if(saved >= 1 && saved <= InpActiveLevels)
       {
          CurrentStep = saved;
          Print("✅ Nivel restaurado desde GlobalVar: ", CurrentStep);
@@ -506,6 +511,7 @@ void SaveStateToFile()
    FileWriteString(handle, "STEP="        + IntegerToString(CurrentStep) + "\n");
    FileWriteString(handle, "ADV_MODE="    + (g_AdvancedMode ? "1" : "0") + "\n");
    FileWriteString(handle, "LIMIT_PRICE=" + DoubleToString(g_LimitPrice, 8) + "\n");
+   for(int i=0;i<20;i++) FileWriteString(handle, "LOT"+IntegerToString(i+1)+"="+DoubleToString(LotArray[i],8)+"\n");
    FileWriteString(handle, "SYMBOL="      + _Symbol + "\n");
    FileWriteString(handle, "MAGIC="       + IntegerToString(InpMagicNumber) + "\n");
    FileWriteString(handle, "SAVED_AT="    + TimeToString(TimeCurrent()) + "\n");
@@ -531,10 +537,12 @@ bool LoadStateFromFile()
       if(key == "STEP")
       {
          int s = (int)StringToInteger(val);
-         if(s >= 1 && s <= 20) { CurrentStep = s; loaded = true; }
+         if(s >= 1 && s <= InpActiveLevels) { CurrentStep = s; loaded = true; }
       }
       else if(key == "ADV_MODE")
          g_AdvancedMode = (StringToInteger(val) > 0);
+      else if(StringFind(key,"LOT")==0)
+      { int li=(int)StringToInteger(StringSubstr(key,3))-1; if(li>=0&&li<20){double lv=StringToDouble(val);if(lv>0)LotArray[li]=lv;} }
       else if(key == "LIMIT_PRICE")
       {
          double lp = StringToDouble(val);
@@ -922,7 +930,7 @@ void UpdateInfoBar()
    double fPL=eq-bal;
    int parts=CalcSplitCount(lot);
    string lotTxt=(parts>1)?StringFormat("%.2f x%d",lot,parts):StringFormat("%.2f",lot);
-   ObjectSetString(0,OBJ_INFOBAR_NIV,OBJPROP_TEXT,StringFormat("%d/20",CurrentStep));
+   ObjectSetString(0,OBJ_INFOBAR_NIV,OBJPROP_TEXT,StringFormat("%d/%d",CurrentStep,InpActiveLevels));
    ObjectSetString(0,OBJ_INFOBAR_LOT,OBJPROP_TEXT,lotTxt);
    ObjectSetString(0,OBJ_INFOBAR_PL,OBJPROP_TEXT,StringFormat("%s%.2f",(fPL>=0)?"+":"",fPL));
    ObjectSetInteger(0,OBJ_INFOBAR_PL,OBJPROP_COLOR,(fPL>=0)?clrLimeGreen:clrTomato);
@@ -1018,7 +1026,7 @@ void BuildTabOperar()
    y+=13;
 
    int bw=54,bh=26,gx=2,gy=2;
-   for(int i=0;i<20;i++)
+   for(int i=0;i<InpActiveLevels;i++)
    {
       int col=i%5,row=i/5;
       ObjBtn(PFX_OP+"STEP"+IntegerToString(i+1),cx+col*(bw+gx),y+row*(bh+gy),bw,bh,
@@ -1169,7 +1177,8 @@ void BuildTabConfig()
    cfgL[4]="R:R"; cfgV[4]=StringFormat("1:%.2f",TP_Points/MathMax(SL_Points,1)); cfgC[4]=clrMagenta;
    cfgL[5]="Act. 1:2"; cfgV[5]=StringFormat("%.0f pts",Activation_Points); cfgC[5]=clrLimeGreen;
    cfgL[6]="SL Prot."; cfgV[6]=StringFormat("%.0f pts",Protected_SL); cfgC[6]=clrLimeGreen;
-   cfgL[7]="Nivel"; cfgV[7]=StringFormat("Niv.%d (%.2f lots)",CurrentStep,LotArray[CurrentStep-1]); cfgC[7]=clrGold;
+   cfgL[7]="Niveles activos"; cfgV[7]=IntegerToString(InpActiveLevels); cfgC[7]=clrGold;
+   cfgL[8]="Nivel"; cfgV[7]=StringFormat("Niv.%d (%.2f lots)",CurrentStep,LotArray[CurrentStep-1]); cfgC[7]=clrGold;
    cfgL[8]="Dashboard"; cfgV[8]="v4.31 CONECTADO"; cfgC[8]=clrLimeGreen;
    cfgL[9]="Archivo estado"; cfgV[9]=g_StateFileName; cfgC[9]=clrSilver;
    cfgL[10]="Login"; cfgV[10]=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)); cfgC[10]=clrYellow;
@@ -1287,8 +1296,8 @@ bool ModifySL(ulong ticket,double newSL)
    return true;
 }
 
-void ManageOpenPositions()
-{
+void ManageOpenPositions(){
+ if(!InpEnableAdvanced)return;
    double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
    int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
    bool changed=false;
@@ -1346,8 +1355,8 @@ void AnalyzeClosedTrade(TradeRecord &rec)
    int prevStep=CurrentStep;
    if(cp>0&&!rec.slMoved) CurrentStep=1;
    else if(rec.slMoved&&cp>0) CurrentStep=MathMax(1,CurrentStep-((rec.stepLevel<10)?3:4));
-   else if(cp<0) if(CurrentStep<20) CurrentStep++;
-   CurrentStep=MathMax(1,MathMin(20,CurrentStep));
+   else if(cp<0) if(CurrentStep<InpActiveLevels) CurrentStep++;
+   CurrentStep=MathMax(1,MathMin(InpActiveLevels,CurrentStep));
    if(CurrentStep!=prevStep)
    { SaveState(); ExportStateToFile(); Print("💾 Nivel tras cierre: ",CurrentStep); }
 }
@@ -1418,6 +1427,9 @@ bool SendLimitOrder(ENUM_ORDER_TYPE ot,double totalLots,double lp)
    return (sent>0);
 }
 
+void ClosePositionByTicket(ulong t){if(!PositionSelectByTicket(t))return; MqlTradeRequest q={};MqlTradeResult r={};q.action=TRADE_ACTION_DEAL;q.position=t;q.symbol=_Symbol;q.volume=PositionGetDouble(POSITION_VOLUME);q.type=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;q.price=(q.type==ORDER_TYPE_SELL)?SymbolInfoDouble(_Symbol,SYMBOL_BID):SymbolInfoDouble(_Symbol,SYMBOL_ASK);q.deviation=20;q.type_filling=ORDER_FILLING_IOC;OrderSend(q,r);}
+void CloseEverything(){CloseAllPositions();CancelAllPendingOrders();}
+void CancelAllPendingOrders(){for(int i=OrdersTotal()-1;i>=0;i--){ulong t=OrderGetTicket(i);if(t&&OrderSelect(t)){MqlTradeRequest q={};MqlTradeResult r={};q.action=TRADE_ACTION_REMOVE;q.order=t;OrderSend(q,r);}}}
 void CloseAllPositions()
 {
    for(int i=PositionsTotal()-1;i>=0;i--)
@@ -1443,6 +1455,7 @@ void CloseAllPositions()
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   if(InpActiveLevels<1 || InpActiveLevels>20) return INIT_PARAMETERS_INCORRECT;
    SL_Points=InpSL_Points;
    TP_Points=InpTP_Points;
    Activation_Points=InpActivationPoints;
@@ -1456,8 +1469,8 @@ int OnInit()
 
    InitGlobalVarKeys();
    InitSharedFileNames();
-   LoadState();
    InitLotArray();
+   LoadState();
    SyncAllTrades();
    BuildStaticStructure();
    RebuildActiveTab();
@@ -1492,6 +1505,7 @@ void OnTick()
 {
    // ── Leer comandos del Dashboard ──
    ReadCommandsFromFile();
+   if(InpFridayCloseEnabled && TimeDayOfWeek(TimeCurrent())==5 && TimeHour(TimeCurrent())>=23){CloseEverything();}
 
    // ── Lógica original ──
    int prevCount=g_TradeCount;
@@ -1585,7 +1599,9 @@ void OnChartEvent(const int id,const long &lparam,
    if(sparam==PFX_OP+"SELL"){SendMarketOrder(ORDER_TYPE_SELL,lots);return;}
    if(sparam==PFX_OP+"BUYLMT"){SendLimitOrder(ORDER_TYPE_BUY_LIMIT,lots,g_LimitPrice);return;}
    if(sparam==PFX_OP+"SELLLMT"){SendLimitOrder(ORDER_TYPE_SELL_LIMIT,lots,g_LimitPrice);return;}
-   if(sparam==PFX_OP+"CLOSEALL"){CloseAllPositions();return;}
+   if(sparam==PFX_OP+"CLOSEALL"){CloseEverything();return;}
+
+   if(StringFind(sparam,PFX_POS+"CLOSE")==0){int k=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_POS+"CLOSE")));int ri=k+g_ScrollOffset;if(ri>=0&&ri<g_TradeCount)ClosePositionByTicket(g_Trades[ri].ticket);return;}
 
    if(StringFind(sparam,PFX_POS+"ADV")==0&&sparam!=PFX_POS+"ADVALL")
    { int k=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_POS+"ADV")));
