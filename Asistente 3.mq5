@@ -721,8 +721,11 @@ double CalcLotFromRisk(double percent)
    double valuePerPoint=(point/tickSize)*tickValue;
    double riskUSD=InpRiskBaseUSD*(percent/100.0);
    double lot=riskUSD/(InpRiskCalculationSLPoints*valuePerPoint);
-   lot=MathFloor(lot/step)*step;
-   return NormalizeDouble(MathMax(lot,minLot),2);
+   // Redondeo matemático al paso real del broker: >= mitad, sube.
+   double units=lot/step;
+   lot=MathFloor(units+0.5)*step;
+   // Si queda por debajo del mínimo, se utiliza el mínimo permitido.
+   return NormalizeDouble(MathMax(lot,minLot),8);
 }
 
 void InitLotArray()
