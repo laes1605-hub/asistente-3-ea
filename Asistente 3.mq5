@@ -1146,6 +1146,10 @@ void BuildTabPosiciones()
             (tr.profit>=0)?clrLimeGreen:clrTomato,9,"Arial Bold");
       else
          ObjLbl(PFX_POS+"R3"+rid,cx+6,y+28,"Esperando...",C'160,150,80',8,"Arial");
+      if(tr.isPending)
+         ObjBtn(PFX_POS+"CANCEL"+rid,cx+cw-105,y+2,50,44,"CANCELAR",C'115,75,20',clrWhite,7,"Arial Bold");
+      else
+         ObjBtn(PFX_POS+"CLOSE"+rid,cx+cw-105,y+2,50,44,"CERRAR",C'120,30,30',clrWhite,7,"Arial Bold");
       if(!tr.isPending&&!tr.slMoved)
          ObjBtn(PFX_POS+"ADV"+rid,cx+cw-52,y+2,50,44,tr.advActive?"1:2\nON":"1:2\nOFF",
             tr.advActive?C'0,100,0':C'65,65,65',clrWhite,7,"Arial Bold");
@@ -1428,6 +1432,12 @@ bool SendLimitOrder(ENUM_ORDER_TYPE ot,double totalLots,double lp)
 }
 
 void ClosePositionByTicket(ulong t){if(!PositionSelectByTicket(t))return; MqlTradeRequest q={};MqlTradeResult r={};q.action=TRADE_ACTION_DEAL;q.position=t;q.symbol=_Symbol;q.volume=PositionGetDouble(POSITION_VOLUME);q.type=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;q.price=(q.type==ORDER_TYPE_SELL)?SymbolInfoDouble(_Symbol,SYMBOL_BID):SymbolInfoDouble(_Symbol,SYMBOL_ASK);q.deviation=20;q.type_filling=ORDER_FILLING_IOC;OrderSend(q,r);}
+void CancelPendingByTicket(ulong t)
+{
+   if(!OrderSelect(t)) return;
+   MqlTradeRequest q={}; MqlTradeResult r={}; q.action=TRADE_ACTION_REMOVE; q.order=t; q.symbol=_Symbol; OrderSend(q,r);
+}
+
 void CloseEverything(){CloseAllPositions();CancelAllPendingOrders();}
 void CancelAllPendingOrders(){for(int i=OrdersTotal()-1;i>=0;i--){ulong t=OrderGetTicket(i);if(t&&OrderSelect(t)){MqlTradeRequest q={};MqlTradeResult r={};q.action=TRADE_ACTION_REMOVE;q.order=t;OrderSend(q,r);}}}
 void CloseAllPositions()
@@ -1604,9 +1614,20 @@ void OnChartEvent(const int id,const long &lparam,
    if(sparam==PFX_OP+"SELLLMT"){SendLimitOrder(ORDER_TYPE_SELL_LIMIT,lots,g_LimitPrice);return;}
    if(sparam==PFX_OP+"CLOSEALL"){CloseEverything();return;}
 
-   if(StringFind(sparam,PFX_POS+"CLOSE")==0){int k=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_POS+"CLOSE")));int ri=k+g_ScrollOffset;if(ri>=0&&ri<g_TradeCount)ClosePositionByTicket(g_Trades[ri].ticket);return;}
+   if(StringFind(sparam,PFX_POS+"CLOSE")==0 || StringFind(sparam,PFX_POS+"CANCEL")==0)
+   {
+      string prefix=(StringFind(sparam,PFX_POS+"CLOSE")==0)?PFX_POS+"CLOSE":PFX_POS+"CANCEL";
+      int k=(int)StringToInteger(StringSubstr(sparam,StringLen(prefix)));
+      int ri=k+g_ScrollOffset;
+      if(ri>=0&&ri<g_TradeCount)
+      {
+         if(g_Trades[ri].isPending) CancelPendingByTicket(g_Trades[ri].ticket);
+         else ClosePositionByTicket(g_Trades[ri].ticket);
+      }
+      return;
+   }
 
-   if(StringFind(sparam,PFX_POS+"ADV")==0&&sparam!=PFX_POS+"ADVALL")
+   if(StringFind(sparam,PFX_POS+"ADV")==0&&sparam!=PFX_POS+"ADVALL")   if(StringFind(sparam,PFX_POS+"ADV")==0&&sparam!=PFX_POS+"ADVALL")
    { int k=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_POS+"ADV")));
      int ri=k+g_ScrollOffset;
      if(ri>=0&&ri<g_TradeCount&&!g_Trades[ri].slMoved&&!g_Trades[ri].isPending)
