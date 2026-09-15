@@ -11,6 +11,14 @@
 input group "=== STOP LOSS / TAKE PROFIT ==="
 input double InpSL_Points        = 95;
 input double InpTP_Points        = 305;
+input bool   InpUsePercentageRisk = true;
+input double InpRiskBaseUSD       = 1000.0;
+input double InpRiskCalculationSLPoints = 100.0;
+input double InpSLReductionPoints = 7.0;
+input double InpRiskPercent1=1.0, InpRiskPercent2=2.0, InpRiskPercent3=3.0, InpRiskPercent4=4.0, InpRiskPercent5=5.0;
+input double InpRiskPercent6=6.0, InpRiskPercent7=7.0, InpRiskPercent8=8.0, InpRiskPercent9=9.0, InpRiskPercent10=10.0;
+input double InpRiskPercent11=11.0, InpRiskPercent12=12.0, InpRiskPercent13=13.0, InpRiskPercent14=14.0, InpRiskPercent15=15.0;
+input double InpRiskPercent16=16.0, InpRiskPercent17=17.0, InpRiskPercent18=18.0, InpRiskPercent19=19.0, InpRiskPercent20=20.0;
 
 input group "=== GESTIÓN AVANZADA 1:2 ==="
 input double InpActivationPoints = 210;
@@ -114,6 +122,7 @@ double      SL_Points;
 double      TP_Points;
 double      Activation_Points;
 double      Protected_SL;
+double      RiskPercent[20];
 double      g_LimitPrice   = 0.0;
 bool g_AdvancedMode=false;
 datetime g_LastFridayClose=0;
@@ -701,6 +710,21 @@ void EnforceSLTP()
    }
 }
 
+double CalcLotFromRisk(double percent)
+{
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   double tickValue=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tickSize=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   double minLot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   if(point<=0 || tickSize<=0 || tickValue<=0 || InpRiskCalculationSLPoints<=0) return minLot;
+   double valuePerPoint=(point/tickSize)*tickValue;
+   double riskUSD=InpRiskBaseUSD*(percent/100.0);
+   double lot=riskUSD/(InpRiskCalculationSLPoints*valuePerPoint);
+   lot=MathFloor(lot/step)*step;
+   return NormalizeDouble(MathMax(lot,minLot),2);
+}
+
 void InitLotArray()
 {
    LotArray[0]=InpLotStep1;  LotArray[1]=InpLotStep2;  LotArray[2]=InpLotStep3;
@@ -710,6 +734,11 @@ void InitLotArray()
    LotArray[12]=InpLotStep13; LotArray[13]=InpLotStep14; LotArray[14]=InpLotStep15;
    LotArray[15]=InpLotStep16; LotArray[16]=InpLotStep17; LotArray[17]=InpLotStep18;
    LotArray[18]=InpLotStep19; LotArray[19]=InpLotStep20;
+   RiskPercent[0]=InpRiskPercent1; RiskPercent[1]=InpRiskPercent2; RiskPercent[2]=InpRiskPercent3; RiskPercent[3]=InpRiskPercent4; RiskPercent[4]=InpRiskPercent5;
+   RiskPercent[5]=InpRiskPercent6; RiskPercent[6]=InpRiskPercent7; RiskPercent[7]=InpRiskPercent8; RiskPercent[8]=InpRiskPercent9; RiskPercent[9]=InpRiskPercent10;
+   RiskPercent[10]=InpRiskPercent11; RiskPercent[11]=InpRiskPercent12; RiskPercent[12]=InpRiskPercent13; RiskPercent[13]=InpRiskPercent14; RiskPercent[14]=InpRiskPercent15;
+   RiskPercent[15]=InpRiskPercent16; RiskPercent[16]=InpRiskPercent17; RiskPercent[17]=InpRiskPercent18; RiskPercent[18]=InpRiskPercent19; RiskPercent[19]=InpRiskPercent20;
+   if(InpUsePercentageRisk) for(int i=0;i<20;i++) LotArray[i]=CalcLotFromRisk(RiskPercent[i]);
 }
 
 //+------------------------------------------------------------------+
@@ -1466,7 +1495,7 @@ void CloseAllPositions()
 int OnInit()
 {
    if(InpActiveLevels<1 || InpActiveLevels>20) return INIT_PARAMETERS_INCORRECT;
-   SL_Points=InpSL_Points;
+   SL_Points=InpUsePercentageRisk ? MathMax(1.0,InpRiskCalculationSLPoints-InpSLReductionPoints) : InpSL_Points;
    TP_Points=InpTP_Points;
    Activation_Points=InpActivationPoints;
    Protected_SL=InpProtectedSL;
