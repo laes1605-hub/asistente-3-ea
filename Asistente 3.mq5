@@ -461,45 +461,12 @@ void InitGlobalVarKeys()
    GV_LIMIT_PRICE = GV_PREFIX + "LIMIT_" + suffix;
 }
 
-string GetLotProfileFileName()
-{
-   return "GQP_LOTS_" + IntegerToString(InpMagicNumber) + ".dat";
-}
-
-void SaveLotProfile()
-{
-   int h=FileOpen(GetLotProfileFileName(),FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
-   if(h==INVALID_HANDLE) return;
-   FileWriteString(h,"VERSION=1\n");
-   for(int i=0;i<20;i++) FileWriteString(h,"LOT"+IntegerToString(i+1)+"="+DoubleToString(LotArray[i],8)+"\n");
-   FileWriteString(h,"SAVED_AT="+TimeToString(TimeCurrent())+"\n");
-   FileClose(h);
-}
-
-bool LoadLotProfile()
-{
-   string fn=GetLotProfileFileName();
-   if(!FileIsExist(fn,FILE_COMMON)) return false;
-   int h=FileOpen(fn,FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON);
-   if(h==INVALID_HANDLE) return false;
-   while(!FileIsEnding(h))
-   {
-      string line=FileReadString(h); StringTrimLeft(line); StringTrimRight(line);
-      int sep=StringFind(line,"="); if(sep<0) continue;
-      string key=StringSubstr(line,0,sep);
-      if(StringFind(key,"LOT")==0)
-      { int i=(int)StringToInteger(StringSubstr(key,3))-1; double v=StringToDouble(StringSubstr(line,sep+1)); if(i>=0&&i<20&&v>0) LotArray[i]=v; }
-   }
-   FileClose(h); return true;
-}
-
 void SaveState()
 {
    GlobalVariableSet(GV_STEP,        (double)CurrentStep);
    GlobalVariableSet(GV_ADV_MODE,    g_AdvancedMode ? 1.0 : 0.0);
    GlobalVariableSet(GV_LIMIT_PRICE, g_LimitPrice);
    SaveStateToFile();
-   SaveLotProfile();
 }
 
 void LoadState()
@@ -1503,7 +1470,6 @@ int OnInit()
    InitGlobalVarKeys();
    InitSharedFileNames();
    InitLotArray();
-   LoadLotProfile();
    LoadState();
    SyncAllTrades();
    BuildStaticStructure();
