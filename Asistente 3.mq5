@@ -9,12 +9,13 @@
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
 input group "=== STOP LOSS / TAKE PROFIT ==="
-input double InpSL_Points        = 95;
 input double InpTP_Points        = 305;
-input bool   InpUsePercentageRisk = true;
-input double InpRiskBaseUSD       = 1000.0;
+input group "=== RIESGO PORCENTUAL Y SL ==="
+input double InpRiskBaseUSD = 1000.0;
 input double InpRiskCalculationSLPoints = 100.0;
-input double InpSLReductionPoints = 7.0;
+input double InpSLReductionPoints = 7.0; // SL colocado = divisor - reducción
+
+input group "=== PORCENTAJES POR NIVEL ==="
 input double InpRiskPercent1=1.0, InpRiskPercent2=2.0, InpRiskPercent3=3.0, InpRiskPercent4=4.0, InpRiskPercent5=5.0;
 input double InpRiskPercent6=6.0, InpRiskPercent7=7.0, InpRiskPercent8=8.0, InpRiskPercent9=9.0, InpRiskPercent10=10.0;
 input double InpRiskPercent11=11.0, InpRiskPercent12=12.0, InpRiskPercent13=13.0, InpRiskPercent14=14.0, InpRiskPercent15=15.0;
@@ -27,28 +28,6 @@ input bool   InpAutoFromLevel5   = true;
 input bool InpEnableAdvanced=true;
 input bool InpFridayCloseEnabled=true;
 input int InpFridayCloseMinutes=30;
-
-input group "=== LOTAJES POR NIVEL ==="
-input double InpLotStep1   = 0.01;
-input double InpLotStep2   = 0.02;
-input double InpLotStep3   = 0.03;
-input double InpLotStep4   = 0.04;
-input double InpLotStep5   = 0.06;
-input double InpLotStep6   = 0.09;
-input double InpLotStep7   = 0.13;
-input double InpLotStep8   = 0.19;
-input double InpLotStep9   = 0.28;
-input double InpLotStep10  = 0.42;
-input double InpLotStep11  = 0.63;
-input double InpLotStep12  = 0.94;
-input double InpLotStep13  = 1.41;
-input double InpLotStep14  = 2.12;
-input double InpLotStep15  = 3.18;
-input double InpLotStep16  = 4.77;
-input double InpLotStep17  = 7.15;
-input double InpLotStep18  = 10.73;
-input double InpLotStep19  = 16.09;
-input double InpLotStep20  = 24.14;
 
 input group "=== SPLIT DE LOTES ==="
 input double InpMaxLotsPerOrder  = 100.0;
@@ -730,18 +709,12 @@ double CalcLotFromRisk(double percent)
 
 void InitLotArray()
 {
-   LotArray[0]=InpLotStep1;  LotArray[1]=InpLotStep2;  LotArray[2]=InpLotStep3;
-   LotArray[3]=InpLotStep4;  LotArray[4]=InpLotStep5;  LotArray[5]=InpLotStep6;
-   LotArray[6]=InpLotStep7;  LotArray[7]=InpLotStep8;  LotArray[8]=InpLotStep9;
-   LotArray[9]=InpLotStep10; LotArray[10]=InpLotStep11; LotArray[11]=InpLotStep12;
-   LotArray[12]=InpLotStep13; LotArray[13]=InpLotStep14; LotArray[14]=InpLotStep15;
-   LotArray[15]=InpLotStep16; LotArray[16]=InpLotStep17; LotArray[17]=InpLotStep18;
-   LotArray[18]=InpLotStep19; LotArray[19]=InpLotStep20;
+   for(int i=0;i<20;i++) LotArray[i]=0.0;
    RiskPercent[0]=InpRiskPercent1; RiskPercent[1]=InpRiskPercent2; RiskPercent[2]=InpRiskPercent3; RiskPercent[3]=InpRiskPercent4; RiskPercent[4]=InpRiskPercent5;
    RiskPercent[5]=InpRiskPercent6; RiskPercent[6]=InpRiskPercent7; RiskPercent[7]=InpRiskPercent8; RiskPercent[8]=InpRiskPercent9; RiskPercent[9]=InpRiskPercent10;
    RiskPercent[10]=InpRiskPercent11; RiskPercent[11]=InpRiskPercent12; RiskPercent[12]=InpRiskPercent13; RiskPercent[13]=InpRiskPercent14; RiskPercent[14]=InpRiskPercent15;
    RiskPercent[15]=InpRiskPercent16; RiskPercent[16]=InpRiskPercent17; RiskPercent[17]=InpRiskPercent18; RiskPercent[18]=InpRiskPercent19; RiskPercent[19]=InpRiskPercent20;
-   if(InpUsePercentageRisk) for(int i=0;i<20;i++) LotArray[i]=CalcLotFromRisk(RiskPercent[i]);
+   for(int i=0;i<20;i++) LotArray[i]=CalcLotFromRisk(RiskPercent[i]);
 }
 
 //+------------------------------------------------------------------+
@@ -1498,7 +1471,7 @@ void CloseAllPositions()
 int OnInit()
 {
    if(InpActiveLevels<1 || InpActiveLevels>20) return INIT_PARAMETERS_INCORRECT;
-   SL_Points=InpUsePercentageRisk ? MathMax(1.0,InpRiskCalculationSLPoints-InpSLReductionPoints) : InpSL_Points;
+   SL_Points=MathMax(1.0,InpRiskCalculationSLPoints-InpSLReductionPoints);
    TP_Points=InpTP_Points;
    Activation_Points=InpActivationPoints;
    Protected_SL=InpProtectedSL;
