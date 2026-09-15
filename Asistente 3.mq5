@@ -1505,7 +1505,10 @@ void OnTick()
 {
    // ── Leer comandos del Dashboard ──
    ReadCommandsFromFile();
-   if(InpFridayCloseEnabled && TimeDayOfWeek(TimeCurrent())==5 && TimeHour(TimeCurrent())>=23){CloseEverything();}
+   MqlDateTime friday_now;
+   TimeToStruct(TimeCurrent(),friday_now);
+   if(InpFridayCloseEnabled && friday_now.day_of_week==5 && friday_now.hour>=23)
+      CloseEverything();
 
    // ── Lógica original ──
    int prevCount=g_TradeCount;
