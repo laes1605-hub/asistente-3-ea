@@ -1,21 +1,26 @@
 //+------------------------------------------------------------------+
-//|                  Asistente 3 - TP Fijo.mq5                       |
+//|                  Asistente 3 - TP Fijo.mq5   (v5.1)              |
 //|                                                                  |
-//|   Copia del Asistente 3 (v4.31) con 3 cambios:                   |
+//|   Riesgo FIJO EN USD por operacion -> el lote se calcula solo.   |
 //|     1) Cierre DIRECTO por TP: no hay trailing stop ni gestion    |
-//|        1:2, el SL nunca se mueve y la operacion cierra solo al   |
+//|        1:2. El SL nunca se mueve; la operacion cierra solo al    |
 //|        tocar TP o SL.                                            |
-//|     2) Sin tabla de lotajes por niveles: UN SOLO lotaje por par, |
-//|        editable desde el panel, desde los inputs o el dashboard. |
-//|     3) El panel muestra cuanto GANARIAS (con el TP del asistente)|
-//|        y cuanto PERDERIAS (con el SL del asistente), en dinero y |
-//|        en % del balance, por operacion y para las posiciones.    |
+//|     2) Sin tabla de lotajes por niveles: se indican los USD que  |
+//|        se arriesgan por operacion y un SL DE DIVISION en puntos  |
+//|        (distinto del SL de la orden) para sacar el lote:         |
+//|          lote = USD / (SL_div_pts * valor_punto_por_lote)        |
+//|        Ej: 10 USD / 100 pts = lote, y el SL real de la orden     |
+//|        es 93 pts -> perdida real 10 * 93/100 = 9.30 USD.         |
+//|     3) El panel muestra cuanto GANARIAS (con el TP del           |
+//|        asistente) y cuanto PERDERIAS (con el SL real del         |
+//|        asistente), en dinero y % del balance, por operacion y    |
+//|        para las posiciones ya abiertas.                          |
 //|   Del resto, igual que el original: linea de limite, split de    |
 //|   lotes, enforce de SL/TP, JSON para el dashboard, persistencia  |
 //|   y tabs OPERAR / CUENTA / POSIC / CONFIG.                       |
 //+------------------------------------------------------------------+
 #property copyright "Gestión Cuantitativa EA"
-#property version   "5.00"
+#property version   "5.10"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -25,8 +30,10 @@ input group "=== STOP LOSS / TAKE PROFIT ==="
 input double InpSL_Points        = 95;      // Stop Loss en puntos (fijo, sin trailing)
 input double InpTP_Points        = 305;     // Take Profit en puntos (cierre directo)
 
-input group "=== LOTAJE ÚNICO POR PAR ==="
-input double InpLots             = 0.01;    // Lotaje (editable también desde el panel)
+input group "=== RIESGO FIJO EN USD POR OPERACIÓN ==="
+input double InpRiskUSD          = 10.0;    // USD arriesgados por operación (riesgo fijo)
+input double InpRiskDivPoints    = 100;      // SL (pts) por el que se DIVIDE el riesgo = lote
+                                             // OJO: no es el SL de la orden (ese es InpSL_Points)
 
 input group "=== SPLIT DE LOTES ==="
 input double InpMaxLotsPerOrder  = 100.0;
@@ -42,7 +49,7 @@ input string InpComment     = "QA_EA";
 //| CONSTANTES                                                       |
 //+------------------------------------------------------------------+
 #define PNL_W        320
-#define PNL_H        466
+#define PNL_H        520
 #define TAB_H        28
 #define CONTENT_Y0   96
 #define CONTENT_H    (PNL_H - CONTENT_Y0 - 6)
@@ -58,11 +65,14 @@ input string InpComment     = "QA_EA";
 #define LINE_LIMIT_SL     "GQP_LIMIT_SL"
 #define LINE_LIMIT_TP     "GQP_LIMIT_TP"
 #define EDIT_PRICE_NAME   "GQP_EDITPRICE"
-#define EDIT_LOT_NAME     "GQP_EDITLOT"
+#define EDIT_RISK_NAME    "GQP_EDITRISK"
+#define EDIT_DIV_NAME     "GQP_EDITDIV"
 
 #define GV_PREFIX         "GQP_"
-string GV_LOTS;
-string GV_LOTS_INP;
+string GV_RISK;        // USD de riesgo usados por operación
+string GV_RISKDIV;     // SL (pts) divisor para el cálculo del lote
+string GV_RISK_INP;    // inputs vigentes al guardar (detecta cambios en MetaEditor)
+string GV_DIV_INP;
 string GV_LIMIT_PRICE;
 
 //+------------------------------------------------------------------+
@@ -91,9 +101,12 @@ struct TradeRecord
 //| GLOBALES                                                         |
 //+------------------------------------------------------------------+
 int         ActiveTab      = TAB_OPERAR;
-double      SL_Points;
-double      TP_Points;
-double      g_Lots         = 0.01;
+double      SL_Points;          // SL real que se envía en la orden
+double      TP_Points;          // TP real que se envía en la orden
+double      RiskUSD        = 0.0;   // USD arriesgados por operación
+double      RiskDivPoints  = 0.0;   // SL (pts) divisor -> lote = RiskUSD/(pts*valorPunto)
+double      g_Lots         = 0.0;   // lote calculado a partir del riesgo
+int         g_LotWarn      = 0;     // 0 ok | 1 se fue al lote mínimo | 2 al máximo
 double      g_LimitPrice   = 0.0;
 
 TradeRecord g_Trades[];
@@ -112,8 +125,8 @@ string PFX_CFG = "GQP_CFG_";
 string TAB_NAMES[N_TABS];
 
 #define OBJ_TITLE        "GQP_TITLE"
+#define OBJ_INFOBAR_RISK "GQP_IB_RISK"
 #define OBJ_INFOBAR_LOT  "GQP_IB_LOT"
-#define OBJ_INFOBAR_RR   "GQP_IB_RR"
 #define OBJ_INFOBAR_PL   "GQP_IB_PL"
 #define OBJ_INFOBAR_EQ   "GQP_IB_EQ"
 
@@ -133,7 +146,8 @@ void BuildTabPosiciones();
 void BuildTabConfig();
 void RefreshTabBar();
 void SyncAllTrades();
-void ApplyLots(double v);
+void RecalcLots();
+void ApplyRisk(double usd,double divpts);
 void LogClosedTrade(const TradeRecord &rec);
 void FlushClosedQueue();
 void SaveState();
@@ -174,12 +188,15 @@ void ExportStateToFile()
    json += "  \"login\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n";
    json += "  \"broker\": \"" + AccountInfoString(ACCOUNT_COMPANY) + "\",\n";
    json += "  \"server\": \"" + AccountInfoString(ACCOUNT_SERVER) + "\",\n";
-   json += "  \"version\": \"5.00\",\n";
+   json += "  \"version\": \"5.10\",\n";
    json += "  \"close_mode\": \"TP_FIJO_SIN_TRAILING\",\n";
 
-   // Estado
+   // Estado (el lote se deriva del riesgo en USD)
+   json += "  \"risk_usd\": " + DoubleToString(RiskUSD, 2) + ",\n";
+   json += "  \"risk_div_sl_points\": " + DoubleToString(RiskDivPoints, 0) + ",\n";
    json += "  \"lots\": " + DoubleToString(g_Lots, 2) + ",\n";
-   json += "  \"lots_mode\": \"fixed\",\n";
+   json += "  \"lots_mode\": \"from_risk_usd\",\n";
+   json += "  \"lot_warning\": " + IntegerToString(g_LotWarn) + ",\n";
    json += "  \"limit_price\": " + DoubleToString(g_LimitPrice, 8) + ",\n";
    json += "  \"trailing_stop\": false,\n";
 
@@ -190,6 +207,7 @@ void ExportStateToFile()
    json += "  \"split_delay_ms\": " + IntegerToString(InpSplitDelayMs) + ",\n";
 
    // Proyección con el SL / TP del asistente
+   json += "  \"risk_target_usd\": " + DoubleToString(RiskUSD, 2) + ",\n";
    json += "  \"expected_loss\": " + DoubleToString(CalcRiskDollars(g_Lots), 2) + ",\n";
    json += "  \"expected_gain\": " + DoubleToString(CalcProfitDollars(g_Lots), 2) + ",\n";
    json += "  \"risk_percent_balance\": " + DoubleToString(RiskPercentBalance(g_Lots), 2) + ",\n";
@@ -310,16 +328,25 @@ void ReadCommandsFromFile()
       changed = true;
    }
 
-   // ── Parsear Lotaje único ─────────────────────
-   double newLots = ExtractJsonDouble(content, "set_lots");
-   if(newLots <= 0) newLots = ExtractJsonDouble(content, "set_lot");
-   if(newLots > 0 && MathAbs(newLots - g_Lots) > 0.0000001)
+   // ── Parsear USD de riesgo ────────────────────
+   double newRisk = ExtractJsonDouble(content, "set_risk_usd");
+   if(newRisk > 0 && MathAbs(newRisk - RiskUSD) > 0.0000001)
    {
-      g_Lots = NormalizeLots(newLots);
-      GlobalVariableSet(GV_LOTS, g_Lots);
-      Print("📱 Dashboard cambió Lotaje a: ", g_Lots);
+      RiskUSD = NormalizeDouble(newRisk, 2);
+      Print("📱 Dashboard cambió Riesgo a: ", RiskUSD, " USD");
       changed = true;
    }
+
+   // ── Parsear SL de división (para el lote) ────
+   double newDiv = ExtractJsonDouble(content, "set_risk_div_sl");
+   if(newDiv >= 1 && MathAbs(newDiv - RiskDivPoints) > 0.0000001)
+   {
+      RiskDivPoints = NormalizeDouble(newDiv, 0);
+      Print("📱 Dashboard cambió SL de división a: ", RiskDivPoints, " pts");
+      changed = true;
+   }
+
+   if(changed) RecalcLots();
 
    // ── Parsear Precio límite ────────────────────
    double newLim = ExtractJsonDouble(content, "set_limit_price");
@@ -388,37 +415,49 @@ double ExtractJsonDouble(string json, string key)
 void InitGlobalVarKeys()
 {
    string suffix  = _Symbol + "_" + IntegerToString(InpMagicNumber);
-   GV_LOTS       = GV_PREFIX + "LOTS_"  + suffix;
-   GV_LOTS_INP   = GV_PREFIX + "LOTSIN_" + suffix;
-   GV_LIMIT_PRICE = GV_PREFIX + "LIMIT_" + suffix;
+   GV_RISK        = GV_PREFIX + "RISK_"    + suffix;
+   GV_RISKDIV     = GV_PREFIX + "RISKDIV_" + suffix;
+   GV_RISK_INP    = GV_PREFIX + "RISKIN_"  + suffix;
+   GV_DIV_INP     = GV_PREFIX + "DIVIN_"   + suffix;
+   GV_LIMIT_PRICE = GV_PREFIX + "LIMIT_"   + suffix;
 }
 
 void SaveState()
 {
-   GlobalVariableSet(GV_LOTS,        g_Lots);
-   GlobalVariableSet(GV_LOTS_INP,    InpLots);
+   GlobalVariableSet(GV_RISK,        RiskUSD);
+   GlobalVariableSet(GV_RISKDIV,     RiskDivPoints);
+   GlobalVariableSet(GV_RISK_INP,    InpRiskUSD);
+   GlobalVariableSet(GV_DIV_INP,     InpRiskDivPoints);
    GlobalVariableSet(GV_LIMIT_PRICE, g_LimitPrice);
    SaveStateToFile();
 }
 
 void LoadState()
 {
-   // Lotaje: el valor del panel manda, salvo que el usuario haya cambiado
-   // el input InpLots (en ese caso se re-aplica el input).
+   // Riesgo: mandan los valores guardados del panel, salvo que el usuario
+   // haya cambiado los inputs en MetaEditor (en ese caso se re-aplican).
    bool loadedGV = false;
-   if(GlobalVariableCheck(GV_LOTS) && GlobalVariableCheck(GV_LOTS_INP))
+   if(GlobalVariableCheck(GV_RISK) && GlobalVariableCheck(GV_RISKDIV) &&
+      GlobalVariableCheck(GV_RISK_INP) && GlobalVariableCheck(GV_DIV_INP))
    {
-      double savedInput = GlobalVariableGet(GV_LOTS_INP);
-      if(MathAbs(savedInput - InpLots) < 0.0000001)
+      bool sameInputs = (MathAbs(GlobalVariableGet(GV_RISK_INP) - InpRiskUSD)       < 0.0000001 &&
+                         MathAbs(GlobalVariableGet(GV_DIV_INP)    - InpRiskDivPoints) < 0.0000001);
+      if(sameInputs)
       {
-         double v = GlobalVariableGet(GV_LOTS);
-         if(v > 0) { g_Lots = NormalizeLots(v); loadedGV = true; }
+         double r = GlobalVariableGet(GV_RISK);
+         double d = GlobalVariableGet(GV_RISKDIV);
+         if(r > 0 && d >= 1)
+         {
+            RiskUSD       = NormalizeDouble(r, 2);
+            RiskDivPoints = NormalizeDouble(d, 0);
+            loadedGV      = true;
+         }
       }
    }
    if(!loadedGV)
    {
-      if(InpLots > 0) g_Lots = NormalizeLots(InpLots);
-      else            g_Lots = NormalizeLots(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+      RiskUSD       = (InpRiskUSD > 0)      ? NormalizeDouble(InpRiskUSD, 2)       : 10.0;
+      RiskDivPoints = (InpRiskDivPoints>=1) ? NormalizeDouble(InpRiskDivPoints, 0) : 100.0;
    }
 
    if(GlobalVariableCheck(GV_LIMIT_PRICE))
@@ -428,10 +467,12 @@ void LoadState()
    }
 
    // Respaldo en disco (por si se reinicia la terminal y se pierden los GV)
-   if(!loadedGV && LoadStateFromFile())
-      Print("✅ Estado restaurado desde archivo de respaldo");
-   else
-      Print("ℹ Lotaje activo: ", DoubleToString(g_Lots, 2), " (", _Symbol, ")");
+   if(!loadedGV) LoadStateFromFile();
+
+   RecalcLots();
+   Print("💰 Riesgo por operación: ", DoubleToString(RiskUSD, 2), " ", AcctCur(),
+         " | SL de división: ", DoubleToString(RiskDivPoints, 0), " pts",
+         " | Lote: ", DoubleToString(g_Lots, 2), " (", _Symbol, ")");
 }
 
 string GetStateFileName()
@@ -444,7 +485,8 @@ void SaveStateToFile()
    string fname  = GetStateFileName();
    int    handle = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI);
    if(handle == INVALID_HANDLE) return;
-   FileWriteString(handle, "LOTS="        + DoubleToString(g_Lots, 2) + "\n");
+   FileWriteString(handle, "RISK_USD="    + DoubleToString(RiskUSD, 2) + "\n");
+   FileWriteString(handle, "RISK_DIV="    + DoubleToString(RiskDivPoints, 0) + "\n");
    FileWriteString(handle, "LIMIT_PRICE=" + DoubleToString(g_LimitPrice, 8) + "\n");
    FileWriteString(handle, "SYMBOL="      + _Symbol + "\n");
    FileWriteString(handle, "MAGIC="       + IntegerToString(InpMagicNumber) + "\n");
@@ -468,10 +510,15 @@ bool LoadStateFromFile()
       if(sep < 0) continue;
       string key = StringSubstr(line, 0, sep);
       string val = StringSubstr(line, sep + 1);
-      if(key == "LOTS")
+      if(key == "RISK_USD")
       {
          double v = StringToDouble(val);
-         if(v > 0.0) { g_Lots = NormalizeLots(v); loaded = true; }
+         if(v > 0.0) { RiskUSD = NormalizeDouble(v, 2); loaded = true; }
+      }
+      else if(key == "RISK_DIV")
+      {
+         double v = StringToDouble(val);
+         if(v >= 1.0) RiskDivPoints = NormalizeDouble(v, 0);
       }
       else if(key == "LIMIT_PRICE")
       {
@@ -559,30 +606,48 @@ string AcctCur()
    return AccountInfoString(ACCOUNT_CURRENCY);
 }
 
-// Ajusta el lotaje a las reglas del símbolo (min / max / step)
-double NormalizeLots(double v)
+// Lote a partir del riesgo: lote = USD / (pts_SL_division * valor_del_punto_por_lote)
+// Se redondea HACIA ABAJO al paso del símbolo para no pasar de riesgo, y se
+// respeta el lote mínimo/máximo del broker (por eso puede existir g_LotWarn).
+double CalcLotFromRisk(int &warn)
 {
-   double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
-   double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   warn = 0;
+   double vpp    = ValuePerPoint();
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   double stepLot= SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(vpp <= 0 || RiskUSD <= 0 || RiskDivPoints < 1) return (minLot > 0 ? minLot : 0.01);
    if(stepLot <= 0) stepLot = 0.01;
    if(minLot  <= 0) minLot  = 0.01;
-   if(maxLot  <= 0) maxLot  = 100.0;
-   v = NormalizeDouble(MathFloor(v / stepLot + 0.5) * stepLot, 2);
-   if(v < minLot) v = minLot;
-   if(v > maxLot) v = maxLot;
-   return v;
+
+   double raw = RiskUSD / (RiskDivPoints * vpp);
+   double lot = MathFloor(raw / stepLot + 0.0000001) * stepLot;
+   if(lot < minLot) { lot = minLot; warn = 1; }
+   if(maxLot > 0 && lot > maxLot) { lot = maxLot; warn = 2; }
+   int vdg = 2;                                  // precisión según el paso del volumen
+   if(stepLot < 0.01)  vdg = 3;
+   if(stepLot < 0.001) vdg = 4;
+   return NormalizeDouble(lot, vdg);
 }
 
-void ApplyLots(double v)
+void RecalcLots()
 {
-   double nv = NormalizeLots(v);
-   if(MathAbs(nv - g_Lots) > 0.0000001)
-   {
-      g_Lots = nv;
-      Print("🎚 Lotaje ajustado a: ", DoubleToString(g_Lots, 2), " (", _Symbol, ")");
-   }
-   else g_Lots = nv;
+   g_Lots = CalcLotFromRisk(g_LotWarn);
+}
+
+// Cambia USD de riesgo y/o SL de división y refresca todo el panel
+void ApplyRisk(double usd,double divpts)
+{
+   if(usd    > 0)  RiskUSD       = NormalizeDouble(usd, 2);
+   if(divpts >= 1) RiskDivPoints = NormalizeDouble(divpts, 0);
+   double old = g_Lots;
+   RecalcLots();
+   if(g_LotWarn == 1)
+      Print("⚠ Con ", DoubleToString(RiskUSD,2), " USD y SL de division ", DoubleToString(RiskDivPoints,0),
+            " pts el lote quedaria por debajo del minimo: se usa el minimo (riesgo real mayor).");
+   if(MathAbs(g_Lots - old) > 0.0000001)
+      Print("🎚 Riesgo ", DoubleToString(RiskUSD,2), " USD / ", DoubleToString(RiskDivPoints,0),
+            " pts -> lote ", DoubleToString(g_Lots,2), " (", _Symbol, ")");
    SaveState();
    ExportStateToFile();
    UpdateInfoBar();
@@ -827,6 +892,15 @@ void ObjEdit(string n,int x,int y,int w,int h,string txt,color bg,color fg,int f
 void ObjSep(string n,int x,int y,int w)
 { ObjRect(n,x,y,w,1,C'70,70,100',C'70,70,100',0); }
 
+// Cuatro botones rápidos junto a un campo de edición
+void DrawStepRow(string base,int x,int y,int bw,int gap,
+                 string t0,string t1,string t2,string t3,color bg)
+{
+   string tt[4]; tt[0]=t0; tt[1]=t1; tt[2]=t2; tt[3]=t3;
+   for(int i=0;i<4;i++)
+      ObjBtn(base+IntegerToString(i),x+i*(bw+gap),y,bw,26,tt[i],bg,clrWhite,8,"Arial Bold");
+}
+
 string GetTypeName(int otype,bool isPending)
 {
    if(!isPending) return(otype==POSITION_TYPE_BUY)?"BUY":"SELL";
@@ -850,13 +924,13 @@ void BuildStaticStructure()
    int x=PNL_X,y=PNL_Y,W=PNL_W;
    ObjRect(PFX+"BG",x,y,W,PNL_H,C'18,18,28',C'70,70,160',2);
    ObjRect(PFX+"TITLE_BG",x,y,W,30,C'8,8,42',C'70,70,200',1);
-   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  TP FIJO · SIN TRAILING  v5.0  ",
+   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  RIESGO USD FIJO · CIERRE POR TP  v5.1  ",
           clrGold,11,"Arial Bold",ANCHOR_CENTER);
 
    int cellW=W/4;
    ObjRect(PFX+"IB_BG",x,y+30,W,34,C'14,22,14',C'40,80,40',1);
-   string ibHdr[4]={"LOTAJE","R:R","P&L","EQUIDAD"};
-   string ibObj[4]={OBJ_INFOBAR_LOT,OBJ_INFOBAR_RR,OBJ_INFOBAR_PL,OBJ_INFOBAR_EQ};
+   string ibHdr[4]={"RIESGO","LOTE","P&L","EQUIDAD"};
+   string ibObj[4]={OBJ_INFOBAR_RISK,OBJ_INFOBAR_LOT,OBJ_INFOBAR_PL,OBJ_INFOBAR_EQ};
    for(int c=0;c<4;c++)
    {
       int cx=x+c*cellW+1,cw=(c<3)?cellW-2:W-cellW*3-2;
@@ -895,12 +969,11 @@ void UpdateInfoBar()
    double eq=AccountInfoDouble(ACCOUNT_EQUITY);
    double bal=AccountInfoDouble(ACCOUNT_BALANCE);
    double fPL=eq-bal;
-   double rr=(SL_Points>0)?TP_Points/SL_Points:0;
    int parts=CalcSplitCount(g_Lots);
    string lotTxt=(parts>1)?StringFormat("%.2f x%d",g_Lots,parts):StringFormat("%.2f",g_Lots);
+   ObjectSetString(0,OBJ_INFOBAR_RISK,OBJPROP_TEXT,StringFormat("%.2f",RiskUSD));
+   ObjectSetInteger(0,OBJ_INFOBAR_RISK,OBJPROP_COLOR,(g_LotWarn==0)?clrGold:clrOrange);
    ObjectSetString(0,OBJ_INFOBAR_LOT,OBJPROP_TEXT,lotTxt);
-   ObjectSetString(0,OBJ_INFOBAR_RR,OBJPROP_TEXT,StringFormat("1:%.2f",rr));
-   ObjectSetInteger(0,OBJ_INFOBAR_RR,OBJPROP_COLOR,clrMagenta);
    ObjectSetString(0,OBJ_INFOBAR_PL,OBJPROP_TEXT,StringFormat("%s%.2f",(fPL>=0)?"+":"",fPL));
    ObjectSetInteger(0,OBJ_INFOBAR_PL,OBJPROP_COLOR,(fPL>=0)?clrLimeGreen:clrTomato);
    ObjectSetString(0,OBJ_INFOBAR_EQ,OBJPROP_TEXT,StringFormat("%.2f",eq));
@@ -918,7 +991,8 @@ void DeleteContentObjects()
          if(StringFind(name,pfxList[p])==0){ObjectDelete(0,name);break;}
    }
    ObjectDelete(0,EDIT_PRICE_NAME);
-   ObjectDelete(0,EDIT_LOT_NAME);
+   ObjectDelete(0,EDIT_RISK_NAME);
+   ObjectDelete(0,EDIT_DIV_NAME);
 }
 
 void DeletePanel()
@@ -930,7 +1004,8 @@ void DeletePanel()
       if(StringFind(name,PFX)==0) ObjectDelete(0,name);
    }
    ObjectDelete(0,EDIT_PRICE_NAME);
-   ObjectDelete(0,EDIT_LOT_NAME);
+   ObjectDelete(0,EDIT_RISK_NAME);
+   ObjectDelete(0,EDIT_DIV_NAME);
    ChartRedraw();
 }
 
@@ -952,12 +1027,15 @@ void BuildTabOperar()
    int cx=x+4,cw=W-8;
    int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
    double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   string cur=AcctCur();
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   double vpp=ValuePerPoint();
 
-   // ── SL / TP / R:R ────────────────────────────
+   // ── SL / TP / R:R de la orden ────────────────
    ObjRect(PFX_OP+"SLTP_BG",cx,y,cw,38,C'28,28,44',C'55,55,90',1);
    double rr=(SL_Points>0)?TP_Points/SL_Points:0;
-   ObjLbl(PFX_OP+"H_SL",cx+4,y+3,"SL:",clrTomato,7,"Arial");
-   ObjLbl(PFX_OP+"V_SL",cx+22,y+3,StringFormat("%.0f pts",SL_Points),clrTomato,7,"Arial Bold");
+   ObjLbl(PFX_OP+"H_SL",cx+4,y+3,"SL orden:",clrTomato,7,"Arial");
+   ObjLbl(PFX_OP+"V_SL",cx+46,y+3,StringFormat("%.0f pts",SL_Points),clrTomato,7,"Arial Bold");
    ObjLbl(PFX_OP+"H_TP",cx+95,y+3,"TP:",clrDodgerBlue,7,"Arial");
    ObjLbl(PFX_OP+"V_TP",cx+113,y+3,StringFormat("%.0f pts",TP_Points),clrDodgerBlue,7,"Arial Bold");
    ObjLbl(PFX_OP+"H_RR",cx+190,y+3,"R:R:",clrMagenta,7,"Arial");
@@ -965,54 +1043,66 @@ void BuildTabOperar()
 
    double mid=MidPriceNorm();
    int parts=CalcSplitCount(g_Lots);
-   ObjLbl(PFX_OP+"V_MID",cx+4,y+14,StringFormat("Mid: %.*f  |  Lot: %.2f",dg,mid,g_Lots),clrSilver,8,"Arial");
+   ObjLbl(PFX_OP+"V_MID",cx+4,y+14,StringFormat("Mid: %.*f  |  Lote: %.2f",dg,mid,g_Lots),clrSilver,8,"Arial");
    if(parts>1) ObjLbl(PFX_OP+"SPLIT_INFO",cx+4,y+25,
-      StringFormat("⚡ SPLIT: %d órdenes",parts),clrYellow,7,"Arial Bold");
+      StringFormat("⚡ SPLIT: %d órdenes de %.2f",parts,CalcSplitLot(g_Lots,0,parts)),clrYellow,7,"Arial Bold");
    else ObjLbl(PFX_OP+"CLOSEMODE",cx+4,y+25,"✔ cierre solo por TP / SL · sin trailing",
       C'120,215,120',7,"Arial");
    y+=42;
 
-   // ── LOTAJE ÚNICO EDITABLE ────────────────────
-   ObjLbl(PFX_OP+"LOT_H",cx+2,y,"LOTAJE POR PAR  (EDITABLE)",clrSilver,7,"Arial");
-   ObjLbl(PFX_OP+"LOT_MIN",cx+cw-2,y,StringFormat("mín %.2f / paso %.2f",
-      SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP)),
+   // ── USD DE RIESGO POR OPERACIÓN (editable) ───
+   ObjLbl(PFX_OP+"RISK_H",cx+2,y,"USD DE RIESGO POR OPERACIÓN",clrGold,7,"Arial");
+   ObjLbl(PFX_OP+"RISK_BAL",cx+cw-2,y,StringFormat("balance %.2f %s",balance,cur),
       C'130,130,160',6,"Arial",ANCHOR_RIGHT_UPPER);
    y+=13;
-   ObjEdit(EDIT_LOT_NAME,cx,y,92,26,DoubleToString(g_Lots,2),C'30,30,48',clrWhite,11);
-   int lbw=51,bx=cx+96;
-   string lb[4]={"-0.01","+0.01","/ 2","x 2"};
-   color  lbc[4]={C'95,45,45',C'40,90,40',C'70,70,95',C'70,70,95'};
-   for(int i=0;i<4;i++)
-      ObjBtn(PFX_OP+"LOTB"+IntegerToString(i),bx+i*(lbw+4),y,lbw,26,lb[i],lbc[i],clrWhite,8,"Arial Bold");
+   ObjEdit(EDIT_RISK_NAME,cx,y,92,26,DoubleToString(RiskUSD,2),C'30,30,48',clrGold,11);
+   DrawStepRow(PFX_OP+"RISKB",cx+96,y,51,4,"-1","+1","/ 2","x 2",C'70,70,95');
    y+=30;
 
-   // ── GANANCIA / PÉRDIDA CON EL SL Y TP DEL ASISTENTE ──
+   // ── SL DE DIVISIÓN (pts) — sólo para el cálculo del lote ──
+   ObjLbl(PFX_OP+"DIV_H",cx+2,y,"SL DE DIVISIÓN (PTS)",clrSilver,7,"Arial");
+   ObjLbl(PFX_OP+"DIV_NOTE",cx+cw-2,y,"divide al USD para sacar el lote (no es el SL de la orden)",
+      C'130,130,160',6,"Arial",ANCHOR_RIGHT_UPPER);
+   y+=13;
+   ObjEdit(EDIT_DIV_NAME,cx,y,92,26,DoubleToString(RiskDivPoints,0),C'30,30,48',clrWhite,11);
+   DrawStepRow(PFX_OP+"DIVB",cx+96,y,51,4,"-10","+10","/ 2","x 2",C'70,70,95');
+   y+=30;
+
+   // ── LOTE CALCULADO ───────────────────────────
+   string lotLine=StringFormat("Lote: %.2f  =  %.2f USD / (%.0f pts x %.2f %s/pt/lote)",
+      g_Lots,RiskUSD,RiskDivPoints,vpp,cur);
+   color lotClr=C'150,200,150';
+   if(g_LotWarn==1){ lotLine+="  ⚠ lote mínimo"; lotClr=clrOrange; }
+   else if(g_LotWarn==2){ lotLine+="  ⚠ lote máximo"; lotClr=clrOrange; }
+   ObjLbl(PFX_OP+"LOTLINE",cx+2,y,lotLine,lotClr,7,"Arial Bold");
+   y+=16;
+
+   // ── CUÁNTO SE PIERDE / CUÁNTO SE GANA CON EL SL Y TP DEL ASISTENTE ──
    ObjSep(PFX_OP+"SEP1",cx,y,cw); y+=6;
    double riskUSD=CalcRiskDollars(g_Lots);
    double profitUSD=CalcProfitDollars(g_Lots);
-   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
-   string cur=AcctCur();
    double pctBal=(balance>0)?(riskUSD/balance)*100.0:0.0;
    double pctWin=(balance>0)?(profitUSD/balance)*100.0:0.0;
+   double pctTgt=(balance>0)?(RiskUSD/balance)*100.0:0.0;
    color riskClr=(pctBal<=1.0)?clrLimeGreen:(pctBal<=2.0)?clrYellow:(pctBal<=5.0)?clrOrange:clrTomato;
 
    int halfw=(cw-6)/2;
    ObjRect(PFX_OP+"LOSS_BG",cx,y,halfw,54,C'36,18,18',C'130,50,50',1);
-   ObjLbl(PFX_OP+"LOSS_H",cx+6,y+4,"PERDERÍA SI TOCA SL",clrTomato,7,"Arial");
+   ObjLbl(PFX_OP+"LOSS_H",cx+6,y+4,StringFormat("PERDERÍA · SL %.0f pts",SL_Points),clrTomato,7,"Arial");
    ObjLbl(PFX_OP+"LOSS_V",cx+6,y+17,StringFormat("-%.2f %s",riskUSD,cur),clrTomato,13,"Arial Bold");
-   ObjLbl(PFX_OP+"LOSS_P",cx+6,y+38,StringFormat("%.2f%% del balance",pctBal),riskClr,7,"Arial");
+   ObjLbl(PFX_OP+"LOSS_P",cx+6,y+38,StringFormat("%.2f%% balance · obj %.2f%%",pctBal,pctTgt),riskClr,7,"Arial");
 
    ObjRect(PFX_OP+"WIN_BG",cx+halfw+6,y,halfw,54,C'18,34,18',C'50,130,50',1);
-   ObjLbl(PFX_OP+"WIN_H",cx+halfw+12,y+4,"GANARÍA SI TOCA TP",clrLimeGreen,7,"Arial");
+   ObjLbl(PFX_OP+"WIN_H",cx+halfw+12,y+4,StringFormat("GANARÍA · TP %.0f pts",TP_Points),clrLimeGreen,7,"Arial");
    ObjLbl(PFX_OP+"WIN_V",cx+halfw+12,y+17,StringFormat("+%.2f %s",profitUSD,cur),clrLimeGreen,13,"Arial Bold");
-   ObjLbl(PFX_OP+"WIN_P",cx+halfw+12,y+38,StringFormat("%.2f%% del balance",pctWin),clrLimeGreen,7,"Arial");
+   ObjLbl(PFX_OP+"WIN_P",cx+halfw+12,y+38,StringFormat("%.2f%% balance · R:R 1:%.2f",pctWin,rr),clrLimeGreen,7,"Arial");
    y+=58;
 
-   double pPerLot=NormalizeDouble(ValuePerPoint()*SL_Points,2);
    ObjLbl(PFX_OP+"PRICES",cx+2,y,
-      StringFormat("Mid → SL %.*f | TP %.*f  ·  %.2f %s/lote a SL  ·  %.2f %s/lote a TP",
+      StringFormat("Mid → SL %.*f | TP %.*f  ·  %.2f %s/lote a SL · %.2f %s/lote a TP",
                    dg,NormalizeDouble(mid-SL_Points*point,dg),dg,NormalizeDouble(mid+TP_Points*point,dg),
-                   pPerLot,cur,NormalizeDouble(ValuePerPoint()*TP_Points,2),cur),C'150,150,190',7,"Arial");
+                   NormalizeDouble(vpp*SL_Points,2),cur,NormalizeDouble(vpp*TP_Points,2),cur),
+      C'150,150,190',7,"Arial");
    y+=16;
 
    // ── PRECIO LÍMITE ────────────────────────────
@@ -1075,10 +1165,11 @@ void BuildTabCuenta()
    else {mTxt=StringFormat("%.0f%%",mrgLv);mC=clrTomato;}
    BuildCuentaRow(PFX_ACC+"MPC",cx,y,cw,34,"NIVEL MARGEN",mTxt,C'20,25,40',C'45,55,90',mC); y+=42;
 
-   // Proyección de la posición/pedido actual con el lotaje del asistente
+   // Proyección con el lote calculado por riesgo y el SL/TP del asistente
    double rl=CalcRiskDollars(g_Lots), gl=CalcProfitDollars(g_Lots);
-   BuildCuentaRow(PFX_ACC+"EXP",cx,y,cw,34,"SI TOCA TP (1 op.)",StringFormat("+%.2f %s",gl,cur),C'18,32,18',C'45,90,45',clrLimeGreen); y+=38;
-   BuildCuentaRow(PFX_ACC+"EXPL",cx,y,cw,34,"SI TOCA SL (1 op.)",StringFormat("-%.2f %s",rl,cur),C'32,18,18',C'90,45,45',clrTomato); y+=38;
+   BuildCuentaRow(PFX_ACC+"EXPR",cx,y,cw,34,"RIESGO POR OPERACIÓN",StringFormat("%.2f %s  (lote %.2f)",RiskUSD,cur,g_Lots),C'32,30,18',C'90,85,45',clrGold); y+=38;
+   BuildCuentaRow(PFX_ACC+"EXP",cx,y,cw,34,StringFormat("SI TOCA TP (%.0f pts)",TP_Points),StringFormat("+%.2f %s",gl,cur),C'18,32,18',C'45,90,45',clrLimeGreen); y+=38;
+   BuildCuentaRow(PFX_ACC+"EXPL",cx,y,cw,34,StringFormat("SI TOCA SL (%.0f pts)",SL_Points),StringFormat("-%.2f %s",rl,cur),C'32,18,18',C'90,45,45',clrTomato); y+=38;
 
    long accNum=(long)AccountInfoInteger(ACCOUNT_LOGIN);
    string accType=(AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO)?"DEMO":"REAL";
@@ -1163,22 +1254,27 @@ void BuildTabConfig()
    double profitUSD=CalcProfitDollars(g_Lots);
    double balance=AccountInfoDouble(ACCOUNT_BALANCE);
    double pctBal=(balance>0)?(riskUSD/balance)*100.0:0.0;
+   string loteTxt=StringFormat("%.2f",g_Lots);
+   if(g_LotWarn==1) loteTxt+=" ⚠MIN";
+   if(g_LotWarn==2) loteTxt+=" ⚠MAX";
 
-   string cfgL[12],cfgV[12]; color cfgC[12];
+   string cfgL[14],cfgV[14]; color cfgC[14];
    cfgL[0]="Simbolo"; cfgV[0]=_Symbol; cfgC[0]=clrWhite;
    cfgL[1]="Magic"; cfgV[1]=IntegerToString(InpMagicNumber); cfgC[1]=clrYellow;
-   cfgL[2]="Stop Loss"; cfgV[2]=StringFormat("%.0f pts",SL_Points); cfgC[2]=clrTomato;
-   cfgL[3]="Take Profit"; cfgV[3]=StringFormat("%.0f pts",TP_Points); cfgC[3]=clrDodgerBlue;
+   cfgL[2]="SL de la orden"; cfgV[2]=StringFormat("%.0f pts",SL_Points); cfgC[2]=clrTomato;
+   cfgL[3]="TP de la orden"; cfgV[3]=StringFormat("%.0f pts",TP_Points); cfgC[3]=clrDodgerBlue;
    cfgL[4]="R:R"; cfgV[4]=StringFormat("1:%.2f",TP_Points/MathMax(SL_Points,1)); cfgC[4]=clrMagenta;
-   cfgL[5]="Lotaje"; cfgV[5]=StringFormat("%.2f (fijo)",g_Lots); cfgC[5]=clrGold;
-   cfgL[6]="Pierde con SL"; cfgV[6]=StringFormat("-%.2f %s (%.2f%%)",riskUSD,cur,pctBal); cfgC[6]=clrTomato;
-   cfgL[7]="Gana con TP"; cfgV[7]=StringFormat("+%.2f %s",profitUSD,cur); cfgC[7]=clrLimeGreen;
-   cfgL[8]="Cierre"; cfgV[8]="TP FIJO · SIN TRAILING"; cfgC[8]=clrGold;
-   cfgL[9]="Archivo estado"; cfgV[9]=g_StateFileName; cfgC[9]=clrSilver;
-   cfgL[10]="Login"; cfgV[10]=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)); cfgC[10]=clrYellow;
-   cfgL[11]="Broker"; cfgV[11]=AccountInfoString(ACCOUNT_COMPANY); cfgC[11]=clrSilver;
+   cfgL[5]="Riesgo por op."; cfgV[5]=StringFormat("%.2f %s",RiskUSD,cur); cfgC[5]=clrGold;
+   cfgL[6]="SL de división"; cfgV[6]=StringFormat("%.0f pts",RiskDivPoints); cfgC[6]=clrGold;
+   cfgL[7]="Lote calculado"; cfgV[7]=loteTxt; cfgC[7]=(g_LotWarn==0)?clrLimeGreen:clrOrange;
+   cfgL[8]="Pierde con SL"; cfgV[8]=StringFormat("-%.2f %s (%.2f%%)",riskUSD,cur,pctBal); cfgC[8]=clrTomato;
+   cfgL[9]="Gana con TP"; cfgV[9]=StringFormat("+%.2f %s",profitUSD,cur); cfgC[9]=clrLimeGreen;
+   cfgL[10]="Cierre"; cfgV[10]="TP FIJO · SIN TRAILING"; cfgC[10]=clrGold;
+   cfgL[11]="Archivo estado"; cfgV[11]=g_StateFileName; cfgC[11]=clrSilver;
+   cfgL[12]="Login"; cfgV[12]=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)); cfgC[12]=clrYellow;
+   cfgL[13]="Broker"; cfgV[13]=AccountInfoString(ACCOUNT_COMPANY); cfgC[13]=clrSilver;
 
-   for(int i=0;i<12;i++)
+   for(int i=0;i<14;i++)
    {
       color bg=(i%2==0)?C'24,24,36':C'20,20,30';
       ObjRect(PFX_CFG+"ROW"+IntegerToString(i),cx,y,cw,20,bg,bg,0);
@@ -1190,9 +1286,10 @@ void BuildTabConfig()
    ObjSep(PFX_CFG+"S2",cx,y,cw); y+=6;
    ObjBtn(PFX_CFG+"SAVESTATE",cx,y,cw,24,"💾 Guardar estado",C'30,80,30',clrWhite,8,"Arial Bold");
    y+=30;
-   ObjRect(PFX_CFG+"NOTE_BG",cx,y,cw,30,C'24,32,24',C'50,100,50',1);
-   ObjLbl(PFX_CFG+"NOTE1",cx+6,y+4,"El SL NUNCA se mueve: nada de trailing ni break-even.",clrLimeGreen,7,"Arial");
-   ObjLbl(PFX_CFG+"NOTE2",cx+6,y+16,"La operación cierra al tocar TP o SL (o con CERRAR TODAS).",clrSilver,7,"Arial");
+   ObjRect(PFX_CFG+"NOTE_BG",cx,y,cw,44,C'24,32,24',C'50,100,50',1);
+   ObjLbl(PFX_CFG+"NOTE1",cx+6,y+4,"Lote = USD riesgo / (pts SL división x valor punto/lote).",clrLimeGreen,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE2",cx+6,y+16,"El SL de división SOLO calcula el lote; el SL de la orden es",clrSilver,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE3",cx+6,y+28,"otro valor y el SL NUNCA se mueve (nada de trailing ni BE).",clrSilver,7,"Arial");
 }
 
 //+------------------------------------------------------------------+
@@ -1261,9 +1358,16 @@ double ReadEditPrice()
    return StringToDouble(t);
 }
 
-double ReadEditLot()
+double ReadEditRisk()
 {
-   string t=ObjectGetString(0,EDIT_LOT_NAME,OBJPROP_TEXT);
+   string t=ObjectGetString(0,EDIT_RISK_NAME,OBJPROP_TEXT);
+   StringTrimLeft(t); StringTrimRight(t);
+   return StringToDouble(t);
+}
+
+double ReadEditDiv()
+{
+   string t=ObjectGetString(0,EDIT_DIV_NAME,OBJPROP_TEXT);
    StringTrimLeft(t); StringTrimRight(t);
    return StringToDouble(t);
 }
@@ -1431,9 +1535,10 @@ int OnInit()
    // Exportar estado inicial
    ExportStateToFile();
 
-   Print("EA v5.00 TP FIJO (sin trailing) | Lotaje ", DoubleToString(g_Lots,2),
-         " | SL ", DoubleToString(SL_Points,0), " pts | TP ", DoubleToString(TP_Points,0),
-         " pts | ", _Symbol, " | Magic: ", IntegerToString(InpMagicNumber),
+   Print("EA v5.10 TP FIJO (sin trailing) | Riesgo ", DoubleToString(RiskUSD,2), " USD por op",
+         " | SL división ", DoubleToString(RiskDivPoints,0), " pts -> lote ", DoubleToString(g_Lots,2),
+         " | SL orden ", DoubleToString(SL_Points,0), " pts | TP ", DoubleToString(TP_Points,0), " pts",
+         " | ", _Symbol, " | Magic: ", IntegerToString(InpMagicNumber),
          " | Login: ", IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)));
    return INIT_SUCCEEDED;
 }
@@ -1459,6 +1564,8 @@ void OnTick()
 
    // ── Lógica del asistente ──
    int prevCount=g_TradeCount;
+   double prevLot=g_Lots;
+   RecalcLots();               // el lote sigue dependiendo del riesgo y del tick value
    SyncAllTrades();
    EnforceSLTP();            // asegura SL/TP, NUNCA los mueve (sin trailing)
    FlushClosedQueue();       // log de cada cierre (por TP o por SL)
@@ -1474,7 +1581,7 @@ void OnTick()
    if(g_ExportCounter >= 50)
    { ExportStateToFile(); g_ExportCounter = 0; }
 
-   if(g_TradeCount!=prevCount) RebuildActiveTab();
+   if(g_TradeCount!=prevCount||MathAbs(g_Lots-prevLot)>0.0000001) RebuildActiveTab();
    else if(ActiveTab==TAB_CUENTA||ActiveTab==TAB_POSIC)
    {
       DeleteContentObjects();
@@ -1499,14 +1606,21 @@ void OnChartEvent(const int id,const long &lparam,
      GlobalVariableSet(GV_LIMIT_PRICE,g_LimitPrice);
      UpdateLimitLine(); return; }
 
-   // ── Edición del lotaje ──
-   if(id==CHARTEVENT_OBJECT_ENDEDIT&&sparam==EDIT_LOT_NAME)
-   { double val=ReadEditLot();
+   // ── Edición del USD de riesgo ──
+   if(id==CHARTEVENT_OBJECT_ENDEDIT&&sparam==EDIT_RISK_NAME)
+   { double val=ReadEditRisk();
      if(val<=0)
-     { Print("⚠ Lotaje inválido, se mantiene ",DoubleToString(g_Lots,2));
-       RebuildActiveTab(); return;
-     }
-     ApplyLots(val); return; }
+     { Print("⚠ Riesgo inválido, se mantiene ",DoubleToString(RiskUSD,2)," USD");
+       RebuildActiveTab(); return; }
+     ApplyRisk(val,RiskDivPoints); return; }
+
+   // ── Edición del SL de división ──
+   if(id==CHARTEVENT_OBJECT_ENDEDIT&&sparam==EDIT_DIV_NAME)
+   { double val=ReadEditDiv();
+     if(val<1)
+     { Print("⚠ SL de división inválido, se mantiene ",DoubleToString(RiskDivPoints,0)," pts");
+       RebuildActiveTab(); return; }
+     ApplyRisk(RiskUSD,val); return; }
 
    if(id==CHARTEVENT_OBJECT_DRAG&&sparam==LINE_LIMIT_NAME)
    { double linePrice=ObjectGetDouble(0,LINE_LIMIT_NAME,OBJPROP_PRICE);
@@ -1526,16 +1640,25 @@ void OnChartEvent(const int id,const long &lparam,
    for(int t=0;t<N_TABS;t++)
       if(sparam==PFX+"TAB"+IntegerToString(t)){ActiveTab=t;RebuildActiveTab();return;}
 
-   // ── Botonera de lotaje ──
-   if(StringFind(sparam,PFX_OP+"LOTB")==0)
-   { int b=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_OP+"LOTB")));
-     double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
-     double v=g_Lots;
-     if(b==0) v=g_Lots-step;
-     else if(b==1) v=g_Lots+step;
-     else if(b==2) v=g_Lots/2.0;
-     else if(b==3) v=g_Lots*2.0;
-     ApplyLots(v); return; }
+   // ── Botonera del USD de riesgo (-1 / +1 / ÷2 / x2) ──
+   if(StringFind(sparam,PFX_OP+"RISKB")==0)
+   { int b=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_OP+"RISKB")));
+     double v=RiskUSD;
+     if(b==0) v=RiskUSD-1.0;
+     else if(b==1) v=RiskUSD+1.0;
+     else if(b==2) v=RiskUSD/2.0;
+     else if(b==3) v=RiskUSD*2.0;
+     ApplyRisk(v,RiskDivPoints); return; }
+
+   // ── Botonera del SL de división (-10 / +10 / ÷2 / x2) ──
+   if(StringFind(sparam,PFX_OP+"DIVB")==0)
+   { int b=(int)StringToInteger(StringSubstr(sparam,StringLen(PFX_OP+"DIVB")));
+     double v=RiskDivPoints;
+     if(b==0) v=RiskDivPoints-10.0;
+     else if(b==1) v=RiskDivPoints+10.0;
+     else if(b==2) v=RiskDivPoints/2.0;
+     else if(b==3) v=RiskDivPoints*2.0;
+     ApplyRisk(RiskUSD,v); return; }
 
    // ── Precio límite ──
    if(sparam==PFX_OP+"ASK")
