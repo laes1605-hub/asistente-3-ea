@@ -1,10 +1,14 @@
 # Asistente 3 EA
 
-La versión de riesgo fijo es `Asistente 3 - TP Fijo.mq5` (v5.20).
+La versión de riesgo porcentual es `Asistente 3 - TP Fijo.mq5` (v5.30).
 
 ## Panel OPERAR
 
 El panel principal se redujo a tres cifras —riesgo objetivo, pérdida estimada al SL y ganancia estimada al TP—, un campo para ajustar el riesgo, el precio de las órdenes limit y los botones BUY / SELL / BUY LIMIT / SELL LIMIT. Las pestañas CUENTA, POSIC. y CONFIG se mantienen.
+
+## Riesgo porcentual
+
+`InpRiskPercent` es el porcentaje del máximo balance histórico que se arriesga por operación (por defecto, 4%); se puede cambiar en las Entradas de MetaTrader o en el campo de riesgo de OPERAR. Por ejemplo: balance máximo de 1,000 → riesgo objetivo 40; al llegar a 1,200 → 48. Si el balance luego cae a 1,056, el riesgo sigue siendo 48 hasta que el balance supere 1,200. El máximo se conserva entre reinicios y entre gráficos de la misma cuenta. El monto objetivo se redondea hacia arriba a la unidad entera de la moneda de la cuenta (4% de 1,001 = 40.04 → 41); el lote se ajusta hacia abajo al paso del broker. Si el lote mínimo supera el objetivo, se usa el mínimo y se indica la advertencia correspondiente.
 
 ## Horarios y cierres
 
