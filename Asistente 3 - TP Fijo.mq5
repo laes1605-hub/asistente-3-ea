@@ -1355,9 +1355,10 @@ void BuildTabOperar()
       (g_LimitPrice>0)?DoubleToString(g_LimitPrice,dg):"0",C'30,30,48',clrWhite,10);
    y+=32;
 
-   int quickW=(cw-4)/2;
-   ObjBtn(PFX_OP+"ASK",cx,y,quickW,21,"USAR ASK",C'0,70,110',clrWhite,8,"Arial");
-   ObjBtn(PFX_OP+"BID",cx+quickW+4,y,quickW,21,"USAR BID",C'110,55,0',clrWhite,8,"Arial");
+   int tw=(cw-8)/3;
+   ObjBtn(PFX_OP+"ASK",cx,y,tw,21,"USAR ASK",C'0,70,110',clrWhite,8,"Arial");
+   ObjBtn(PFX_OP+"BID",cx+tw+4,y,tw,21,"USAR BID",C'110,55,0',clrWhite,8,"Arial");
+   ObjBtn(PFX_OP+"RST",cx+2*(tw+4),y,tw,21,"RESET",C'60,60,60',clrWhite,8,"Arial");
    y+=28;
 
    int obw=(cw-4)/2;
