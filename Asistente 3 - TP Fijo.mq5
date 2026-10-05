@@ -1,9 +1,13 @@
 //+------------------------------------------------------------------+
-//|                  Asistente 3 - TP Fijo.mq5   (v5.3)              |
+//|                  Asistente 3 - TP Fijo.mq5   (v5.4)              |
 //|                                                                  |
-//|   Riesgo porcentual sobre el máximo balance histórico. El monto  |
-//|   se redondea hacia arriba a la unidad entera de la cuenta y el  |
-//|   máximo balance nunca disminuye, incluso tras pérdidas.         |
+//|   Riesgo porcentual sobre una base: el máximo balance histórico  |
+//|   (balance completo) o un capital base que arranca en un importe |
+//|   fijo y solo crece con las ganancias posteriores. El porcentaje |
+//|   de riesgo se define ÚNICAMENTE en las Entradas (InpRiskPercent)|
+//|   y el panel lo muestra como texto informativo.                  |
+//|   El monto se redondea hacia arriba a la unidad entera de la     |
+//|   cuenta y la base nunca disminuye, incluso tras pérdidas.       |
 //|   El lote se calcula con el divisor de puntos y se ajusta hacia  |
 //|   abajo al paso del broker cuando el lote mínimo lo permite.     |
 //|   El SL/TP de cada operación siguen siendo fijos; no hay trailing.|
@@ -12,8 +16,17 @@
 //|   y tabs OPERAR / CUENTA / POSIC / CONFIG.                       |
 //+------------------------------------------------------------------+
 #property copyright "Gestión Cuantitativa EA"
-#property version   "5.30"
+#property version   "5.40"
 #property strict
+
+//+------------------------------------------------------------------+
+//| BASE DE CÁLCULO DEL RIESGO                                       |
+//+------------------------------------------------------------------+
+enum ENUM_RISK_BASE_MODE
+{
+   RISK_BASE_FULL_BALANCE = 0,   // Balance completo (máximo histórico)
+   RISK_BASE_CAPITAL      = 1    // Capital base + ganancias acumuladas
+};
 
 //+------------------------------------------------------------------+
 //| INPUTS                                                           |
@@ -22,10 +35,14 @@ input group "=== STOP LOSS / TAKE PROFIT ==="
 input double InpSL_Points        = 95;      // Stop Loss en puntos (fijo, sin trailing)
 input double InpTP_Points        = 305;     // Take Profit en puntos (cierre directo)
 
-input group "=== RIESGO PORCENTUAL DEL MÁXIMO BALANCE ==="
-input double InpRiskPercent      = 4.0;     // Porcentaje del máximo balance histórico
+input group "=== RIESGO PORCENTUAL (SOLO DESDE ENTRADAS) ==="
+input double InpRiskPercent      = 4.0;     // Porcentaje de la base de riesgo por operación
 input double InpRiskDivPoints    = 100;     // Puntos de división para calcular el lote
                                              // OJO: puede ser distinto del SL real de la orden
+
+input group "=== BASE DE CÁLCULO DEL RIESGO ==="
+input ENUM_RISK_BASE_MODE InpRiskBaseMode = RISK_BASE_FULL_BALANCE; // Balance completo o capital base
+input double InpBaseCapital      = 0.0;     // Capital base (ej: 1500 de 10000). 0 = todo el balance
 
 input group "=== HORARIO DE SESIÓN ==="
 input bool   InpUseSessionFilter          = false;   // Filtrar nuevas entradas por horario
@@ -50,9 +67,11 @@ input string InpComment     = "QA_EA";
 //+------------------------------------------------------------------+
 #define PNL_W             320
 #define PNL_H_OPERAR      310
-#define PNL_H_DETAILS     560
+#define PNL_H_DETAILS     650
 #define TAB_H             28
 #define CONTENT_Y0        96
+#define IB_CELLS          5
+#define CFG_ROWS          21
 
 #define TAB_OPERAR   0
 #define TAB_CUENTA   1
@@ -65,15 +84,16 @@ input string InpComment     = "QA_EA";
 #define LINE_LIMIT_SL     "GQP_LIMIT_SL"
 #define LINE_LIMIT_TP     "GQP_LIMIT_TP"
 #define EDIT_PRICE_NAME   "GQP_EDITPRICE"
-#define EDIT_RISK_NAME    "GQP_EDITRISK"
 
 #define GV_PREFIX         "GQP_"
-string GV_RISK_PERCENT;
 string GV_RISKDIV;
-string GV_RISK_PERCENT_INP;
 string GV_DIV_INP;
 string GV_HIGH_WATER;
 string g_HighWaterFileName;
+string GV_BASE_CAP_INP;
+string GV_BASE_START;
+string GV_BASE_HIGH;
+string g_BaseFileName;
 string GV_LIMIT_PRICE;
 
 //+------------------------------------------------------------------+
@@ -104,9 +124,13 @@ struct TradeRecord
 int         ActiveTab      = TAB_OPERAR;
 double      SL_Points;          // SL real que se envía en la orden
 double      TP_Points;          // TP real que se envía en la orden
-double      RiskPercent       = 4.0;   // Porcentaje del máximo balance
+double      RiskPercent       = 4.0;   // Porcentaje aplicado a la base de riesgo
 double      RiskUSD           = 0.0;   // Importe objetivo, redondeado hacia arriba
 double      g_HighWaterBalance= 0.0;   // Máximo balance observado y persistido
+double      g_RiskBase        = 0.0;   // Base efectiva sobre la que se aplica el porcentaje
+double      g_BaseCapital     = 0.0;   // Capital base configurado (modo capital base)
+double      g_BaseStartBalance= 0.0;   // Balance de referencia al crear la base
+double      g_BaseHighWater   = 0.0;   // Base máxima alcanzada (nunca disminuye)
 double      RiskDivPoints     = 0.0;   // Puntos divisor -> lote = RiskUSD/(pts*valorPunto)
 double      g_Lots            = 0.0;   // lote calculado a partir del riesgo
 int         g_LotWarn      = 0;     // 0 ok | 1 se fue al lote mínimo | 2 al máximo
@@ -128,9 +152,11 @@ string PFX_CFG = "GQP_CFG_";
 string TAB_NAMES[N_TABS];
 
 #define OBJ_TITLE        "GQP_TITLE"
-#define OBJ_INFOBAR_RISK "GQP_IB_RISK"
-#define OBJ_INFOBAR_LOSS "GQP_IB_LOSS"
-#define OBJ_INFOBAR_GAIN "GQP_IB_GAIN"
+#define OBJ_INFOBAR_RISK   "GQP_IB_RISK"
+#define OBJ_INFOBAR_LOSS   "GQP_IB_LOSS"
+#define OBJ_INFOBAR_GAIN   "GQP_IB_GAIN"
+#define OBJ_INFOBAR_EQUITY "GQP_IB_EQUITY"
+#define OBJ_INFOBAR_LOTS   "GQP_IB_LOTS"
 
 int PNL_X, PNL_Y;
 int g_PanelHeight = PNL_H_OPERAR;
@@ -155,9 +181,17 @@ void RefreshTabBar();
 void SyncAllTrades();
 void RecalcLots();
 void UpdateHighWaterBalance();
+void UpdateRiskBase();
 void UpdateRiskAmount();
+void ResetRiskBase();
+bool UseCapitalBase();
+string RiskBaseLabel();
+string RiskBaseShort();
+void LoadBaseState();
+void SaveBaseState();
 string RiskPercentText();
-void ApplyRisk(double percent,double divpts);
+string FmtMoney(double value);
+string FmtLots(double lots);
 void LogClosedTrade(const TradeRecord &rec);
 void FlushClosedQueue();
 void SaveState();
@@ -208,7 +242,7 @@ void ExportStateToFile()
    json += "  \"login\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n";
    json += "  \"broker\": \"" + AccountInfoString(ACCOUNT_COMPANY) + "\",\n";
    json += "  \"server\": \"" + AccountInfoString(ACCOUNT_SERVER) + "\",\n";
-   json += "  \"version\": \"5.30\",\n";
+   json += "  \"version\": \"5.40\",\n";
    json += "  \"close_mode\": \"TP_FIJO_SIN_TRAILING\",\n";
    json += "  \"session_filter_enabled\": " + (InpUseSessionFilter ? "true" : "false") + ",\n";
    json += "  \"session_start\": \"" + InpSessionStart + "\",\n";
@@ -218,13 +252,19 @@ void ExportStateToFile()
    json += "  \"friday_close_minutes\": " + IntegerToString(InpFridayCloseMinutes) + ",\n";
    json += "  \"friday_close_fallback_time\": \"" + InpFridayMarketCloseFallback + "\",\n";
 
-   // Riesgo calculado sobre el máximo balance observado de la cuenta
+   // Riesgo calculado sobre la base elegida: balance completo o capital base
+   string baseMode=(UseCapitalBase()?"capital_base":"full_balance");
+   string lotsMode=(UseCapitalBase()?"from_capital_base_percent":"from_high_water_balance_percent");
    json += "  \"risk_percent\": " + RiskPercentText() + ",\n";
+   json += "  \"risk_base_mode\": \"" + baseMode + "\",\n";
+   json += "  \"risk_base\": " + DoubleToString(g_RiskBase, 2) + ",\n";
+   json += "  \"risk_base_capital\": " + DoubleToString(g_BaseCapital, 2) + ",\n";
+   json += "  \"risk_base_start_balance\": " + DoubleToString(g_BaseStartBalance, 2) + ",\n";
    json += "  \"high_water_balance\": " + DoubleToString(g_HighWaterBalance, 2) + ",\n";
    json += "  \"risk_usd\": " + DoubleToString(RiskUSD, 2) + ",\n";
    json += "  \"risk_div_sl_points\": " + DoubleToString(RiskDivPoints, 0) + ",\n";
    json += "  \"lots\": " + DoubleToString(g_Lots, 2) + ",\n";
-   json += "  \"lots_mode\": \"from_high_water_balance_percent\",\n";
+   json += "  \"lots_mode\": \"" + lotsMode + "\",\n";
    json += "  \"lot_warning\": " + IntegerToString(g_LotWarn) + ",\n";
    json += "  \"limit_price\": " + DoubleToString(g_LimitPrice, 8) + ",\n";
    json += "  \"trailing_stop\": false,\n";
@@ -240,7 +280,8 @@ void ExportStateToFile()
    json += "  \"expected_loss\": " + DoubleToString(CalcRiskDollars(g_Lots), 2) + ",\n";
    json += "  \"expected_gain\": " + DoubleToString(CalcProfitDollars(g_Lots), 2) + ",\n";
    json += "  \"risk_percent_balance\": " + DoubleToString(RiskPercentBalance(g_Lots), 2) + ",\n";
-   json += "  \"expected_loss_percent_high_water\": " + DoubleToString(ExpectedLossPercentHighWater(g_Lots), 2) + ",\n";
+   json += "  \"expected_loss_percent_high_water\": " + DoubleToString(ExpectedLossPercentRiskBase(g_Lots), 2) + ",\n";
+   json += "  \"expected_loss_percent_risk_base\": " + DoubleToString(ExpectedLossPercentRiskBase(g_Lots), 2) + ",\n";
 
    // Cuenta
    json += "  \"balance\": " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",\n";
@@ -358,36 +399,11 @@ void ReadCommandsFromFile()
       changed = true;
    }
 
-   // ── Parsear porcentaje de riesgo ─────────────
-   double newRiskPercent = ExtractJsonDouble(content, "set_risk_percent");
-   if(newRiskPercent > 0)
-   {
-      if(MathAbs(newRiskPercent - RiskPercent) > 0.0000001)
-      {
-         RiskPercent = NormalizeDouble(newRiskPercent, 8);
-         Print("📱 Dashboard cambió riesgo a: ", RiskPercentText(), "% del máximo balance");
-         changed = true;
-      }
-   }
-   else
-   {
-      // Compatibilidad: un comando antiguo en USD se convierte a porcentaje del máximo balance.
-      double legacyRiskUSD = ExtractJsonDouble(content, "set_risk_usd");
-      if(legacyRiskUSD > 0 && g_HighWaterBalance > 0)
-      {
-         double rawPercent=legacyRiskUSD/g_HighWaterBalance*100.0;
-         // Conversión hacia abajo con precisión de 8 decimales para no elevar el riesgo solicitado.
-         double convertedPercent=MathFloor(rawPercent*100000000.0)/100000000.0;
-         if(convertedPercent>0&&MathAbs(convertedPercent-RiskPercent)>0.0000001)
-         {
-            RiskPercent=NormalizeDouble(convertedPercent,8);
-            Print("📱 Riesgo legado convertido a ",RiskPercentText(),"% del máximo balance");
-            changed=true;
-         }
-         else if(convertedPercent<=0)
-            Print("⚠ Riesgo legado demasiado pequeño para representarse; use set_risk_percent.");
-      }
-   }
+   // ── El riesgo solo se define en las Entradas ──
+   // Los comandos del dashboard para cambiarlo se ignoran a propósito.
+   if(ExtractJsonDouble(content, "set_risk_percent") > 0.0 ||
+      ExtractJsonDouble(content, "set_risk_usd") > 0.0)
+      Print("ℹ El riesgo solo se cambia desde las Entradas (InpRiskPercent); comando ignorado.");
 
    // ── Parsear SL de división (para el lote) ────
    double newDiv = ExtractJsonDouble(content, "set_risk_div_sl");
@@ -482,12 +498,14 @@ void InitGlobalVarKeys()
                 StringSubstr(serverKey,StringLen(serverKey)-10,10);
    string accountSuffix=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))+"_"+
                         serverKey+"_"+AccountInfoString(ACCOUNT_CURRENCY);
-   GV_RISK_PERCENT     =GV_PREFIX+"RISKPC_"+suffix;
    GV_RISKDIV          =GV_PREFIX+"RISKDIV_"+suffix;
-   GV_RISK_PERCENT_INP =GV_PREFIX+"RISKPIN_"+suffix;
    GV_DIV_INP          =GV_PREFIX+"DIVIN_"+suffix;
    GV_HIGH_WATER       =GV_PREFIX+"HWM_"+accountSuffix;
    g_HighWaterFileName ="GQP_HWM_"+accountSuffix+".dat";
+   GV_BASE_CAP_INP     =GV_PREFIX+"BASCAPIN_"+accountSuffix;
+   GV_BASE_START       =GV_PREFIX+"BASTART_"+accountSuffix;
+   GV_BASE_HIGH        =GV_PREFIX+"BASHWM_"+accountSuffix;
+   g_BaseFileName      ="GQP_BASE_"+accountSuffix+".dat";
    GV_LIMIT_PRICE      =GV_PREFIX+"LIMIT_"+suffix;
 }
 
@@ -520,37 +538,94 @@ void SaveHighWaterBalanceToFile(double value)
    FileClose(handle);
 }
 
+// Estado del capital base: capital configurado, balance de referencia y base máxima.
+void LoadBaseState()
+{
+   double fCap=0.0,fStart=0.0,fHigh=0.0;
+   int handle=FileOpen(g_BaseFileName,FILE_READ|FILE_TXT|FILE_ANSI);
+   if(handle!=INVALID_HANDLE)
+   {
+      while(!FileIsEnding(handle))
+      {
+         string line=FileReadString(handle);
+         StringTrimLeft(line); StringTrimRight(line);
+         if(StringFind(line,"BASE_CAPITAL_INPUT=")==0)
+            fCap=StringToDouble(StringSubstr(line,StringLen("BASE_CAPITAL_INPUT=")));
+         else if(StringFind(line,"BASE_START_BALANCE=")==0)
+            fStart=StringToDouble(StringSubstr(line,StringLen("BASE_START_BALANCE=")));
+         else if(StringFind(line,"BASE_HIGH_WATER=")==0)
+            fHigh=StringToDouble(StringSubstr(line,StringLen("BASE_HIGH_WATER=")));
+      }
+      FileClose(handle);
+   }
+   if(GlobalVariableCheck(GV_BASE_START))
+   {
+      double gvCap  =GlobalVariableCheck(GV_BASE_CAP_INP)?GlobalVariableGet(GV_BASE_CAP_INP):0.0;
+      double gvStart=GlobalVariableGet(GV_BASE_START);
+      double gvHigh =GlobalVariableCheck(GV_BASE_HIGH)?GlobalVariableGet(GV_BASE_HIGH):0.0;
+      if(gvStart>fStart){fStart=gvStart; fHigh=MathMax(fHigh,gvHigh); fCap=gvCap;}
+   }
+
+   // Solo se reutiliza si el capital base guardado coincide con el input actual.
+   bool sameCapital=MathAbs(fCap-InpBaseCapital)<0.0000001;
+   if(sameCapital&&fStart>0.0)
+   {
+      g_BaseStartBalance=fStart;
+      g_BaseHighWater=MathMax(fHigh,g_BaseCapital);
+   }
+   else
+   {
+      g_BaseStartBalance=0.0;              // se toma en el primer UpdateRiskBase()
+      g_BaseHighWater=g_BaseCapital;
+      if(fStart>0.0)
+         Print("🔄 Capital base cambiado a ",DoubleToString(InpBaseCapital,2)," ",AcctCur(),
+               ": la base se reinicia con el balance actual.");
+   }
+}
+
+void SaveBaseState()
+{
+   if(g_BaseStartBalance<=0.0) return;
+   GlobalVariableSet(GV_BASE_CAP_INP,g_BaseCapital);
+   GlobalVariableSet(GV_BASE_START,g_BaseStartBalance);
+   GlobalVariableSet(GV_BASE_HIGH,g_BaseHighWater);
+   int handle=FileOpen(g_BaseFileName,FILE_WRITE|FILE_TXT|FILE_ANSI);
+   if(handle==INVALID_HANDLE) return;
+   FileWriteString(handle,"BASE_CAPITAL_INPUT="+DoubleToString(g_BaseCapital,2)+"\n");
+   FileWriteString(handle,"BASE_START_BALANCE="+DoubleToString(g_BaseStartBalance,2)+"\n");
+   FileWriteString(handle,"BASE_HIGH_WATER="+DoubleToString(g_BaseHighWater,2)+"\n");
+   FileClose(handle);
+}
+
 void SaveState()
 {
    UpdateRiskAmount();
-   GlobalVariableSet(GV_RISK_PERCENT,RiskPercent);
    GlobalVariableSet(GV_RISKDIV,RiskDivPoints);
-   GlobalVariableSet(GV_RISK_PERCENT_INP,InpRiskPercent);
    GlobalVariableSet(GV_DIV_INP,InpRiskDivPoints);
    GlobalVariableSet(GV_HIGH_WATER,g_HighWaterBalance);
    SaveHighWaterBalanceToFile(g_HighWaterBalance);
+   SaveBaseState();
    GlobalVariableSet(GV_LIMIT_PRICE,g_LimitPrice);
    SaveStateToFile();
 }
 
 void LoadState()
 {
+   // El porcentaje de riesgo viene SIEMPRE de las Entradas; nada lo sobreescribe.
    RiskPercent=(InpRiskPercent>0)?NormalizeDouble(InpRiskPercent,8):0.0;
    RiskDivPoints=(InpRiskDivPoints>=1)?NormalizeDouble(InpRiskDivPoints,0):100.0;
 
    bool loadedGV=false;
    bool sameInputs=false;
-   if(GlobalVariableCheck(GV_RISK_PERCENT_INP)&&GlobalVariableCheck(GV_DIV_INP))
-      sameInputs=(MathAbs(GlobalVariableGet(GV_RISK_PERCENT_INP)-InpRiskPercent)<0.0000001&&
-                  MathAbs(GlobalVariableGet(GV_DIV_INP)-InpRiskDivPoints)<0.0000001);
+   if(GlobalVariableCheck(GV_DIV_INP))
+      sameInputs=MathAbs(GlobalVariableGet(GV_DIV_INP)-InpRiskDivPoints)<0.0000001;
 
-   if(sameInputs&&GlobalVariableCheck(GV_RISK_PERCENT)&&GlobalVariableCheck(GV_RISKDIV))
+   // Solo el divisor del lote admite cambios en caliente (comando del dashboard).
+   if(sameInputs&&GlobalVariableCheck(GV_RISKDIV))
    {
-      double savedPercent=GlobalVariableGet(GV_RISK_PERCENT);
       double savedDiv=GlobalVariableGet(GV_RISKDIV);
-      if(savedPercent>0&&savedDiv>=1)
+      if(savedDiv>=1)
       {
-         RiskPercent=NormalizeDouble(savedPercent,8);
          RiskDivPoints=NormalizeDouble(savedDiv,0);
          loadedGV=true;
       }
@@ -569,13 +644,15 @@ void LoadState()
       if(lp>0.0) g_LimitPrice=lp;
    }
 
-   // El archivo de respaldo restaura el porcentaje solo si sus inputs coinciden.
+   // El archivo de respaldo restaura el divisor solo si sus inputs coinciden.
    if(!loadedGV) LoadStateFromFile(true);
 
+   g_BaseCapital=(InpBaseCapital>0.0)?NormalizeDouble(InpBaseCapital,2):0.0;
+   LoadBaseState();
+
    RecalcLots();
-   Print("💰 Riesgo: ",RiskPercentText(),"% del máximo balance ",
-         DoubleToString(g_HighWaterBalance,2)," ",AcctCur(),
-         " = ",DoubleToString(RiskUSD,2)," ",AcctCur(),
+   Print("💰 Riesgo: ",RiskPercentText(),"% de ",RiskBaseLabel()," = ",
+         DoubleToString(RiskUSD,2)," ",AcctCur(),
          " | lote: ",DoubleToString(g_Lots,2)," (",_Symbol,")");
 }
 
@@ -591,8 +668,9 @@ void SaveStateToFile()
    if(handle==INVALID_HANDLE) return;
    FileWriteString(handle,"RISK_PERCENT="+RiskPercentText()+"\n");
    FileWriteString(handle,"RISK_DIV="+DoubleToString(RiskDivPoints,0)+"\n");
-   FileWriteString(handle,"RISK_PERCENT_INPUT="+DoubleToString(InpRiskPercent,8)+"\n");
    FileWriteString(handle,"RISK_DIV_INPUT="+DoubleToString(InpRiskDivPoints,0)+"\n");
+   FileWriteString(handle,"RISK_BASE_MODE="+IntegerToString((int)InpRiskBaseMode)+"\n");
+   FileWriteString(handle,"RISK_BASE_CAPITAL_INPUT="+DoubleToString(InpBaseCapital,2)+"\n");
    FileWriteString(handle,"LIMIT_PRICE="+DoubleToString(g_LimitPrice,8)+"\n");
    FileWriteString(handle,"SYMBOL="+_Symbol+"\n");
    FileWriteString(handle,"MAGIC="+IntegerToString(InpMagicNumber)+"\n");
@@ -608,7 +686,7 @@ bool LoadStateFromFile(bool loadRiskSettings)
    if(handle==INVALID_HANDLE) return false;
 
    double savedPercent=0.0,savedDiv=0.0;
-   double savedPercentInput=-1.0,savedDivInput=-1.0;
+   double savedDivInput=-1.0;
    bool loadedRisk=false;
    while(!FileIsEnding(handle))
    {
@@ -622,7 +700,6 @@ bool LoadStateFromFile(bool loadRiskSettings)
       string val=StringSubstr(line,sep+1);
       if(key=="RISK_PERCENT") savedPercent=StringToDouble(val);
       else if(key=="RISK_DIV") savedDiv=StringToDouble(val);
-      else if(key=="RISK_PERCENT_INPUT") savedPercentInput=StringToDouble(val);
       else if(key=="RISK_DIV_INPUT") savedDivInput=StringToDouble(val);
       else if(key=="LIMIT_PRICE")
       {
@@ -632,11 +709,9 @@ bool LoadStateFromFile(bool loadRiskSettings)
    }
    FileClose(handle);
 
-   bool sameInputs=(MathAbs(savedPercentInput-InpRiskPercent)<0.0000001&&
-                    MathAbs(savedDivInput-InpRiskDivPoints)<0.0000001);
-   if(loadRiskSettings&&sameInputs&&savedPercent>0.0&&savedDiv>=1.0)
+   bool sameInputs=MathAbs(savedDivInput-InpRiskDivPoints)<0.0000001;
+   if(loadRiskSettings&&sameInputs&&savedDiv>=1.0)
    {
-      RiskPercent=NormalizeDouble(savedPercent,8);
       RiskDivPoints=NormalizeDouble(savedDiv,0);
       loadedRisk=true;
    }
@@ -665,17 +740,92 @@ void UpdateHighWaterBalance()
    g_HighWaterBalance=maximum;
 }
 
+// Base efectiva sobre la que se aplica el porcentaje de riesgo:
+//   · Balance completo: el máximo balance histórico de la cuenta.
+//   · Capital base: un importe fijo que solo crece con las ganancias posteriores.
+void UpdateRiskBase()
+{
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   UpdateHighWaterBalance();
+
+   if(!UseCapitalBase())
+   {
+      g_RiskBase=g_HighWaterBalance;
+      return;
+   }
+
+   if(g_BaseCapital<=0.0) g_BaseCapital=NormalizeDouble(InpBaseCapital,2);
+
+   // Primera ejecución (o tras un reinicio): se fija el balance de referencia.
+   if(g_BaseStartBalance<=0.0)
+   {
+      g_BaseStartBalance=balance;
+      if(g_BaseHighWater<g_BaseCapital) g_BaseHighWater=g_BaseCapital;
+      SaveBaseState();
+      Print("📌 Base de riesgo creada: ",DoubleToString(g_BaseCapital,2)," ",AcctCur(),
+            " | balance de referencia: ",DoubleToString(balance,2)," ",AcctCur());
+   }
+
+   // La base suma las ganancias acumuladas y nunca retrocede, aunque el balance caiga.
+   double candidate=g_BaseCapital+(balance-g_BaseStartBalance);
+   if(candidate<g_BaseCapital) candidate=g_BaseCapital;
+   double stored=GlobalVariableCheck(GV_BASE_HIGH)?GlobalVariableGet(GV_BASE_HIGH):0.0;
+   double maximum=MathMax(MathMax(g_BaseHighWater,stored),candidate);
+   if(maximum>g_BaseHighWater+0.0000001||maximum>stored+0.0000001) SaveBaseState();
+   g_BaseHighWater=maximum;
+   g_RiskBase=maximum;
+}
+
 void UpdateRiskAmount()
 {
-   UpdateHighWaterBalance();
-   if(RiskPercent<=0.0||g_HighWaterBalance<=0.0)
+   UpdateRiskBase();
+   if(RiskPercent<=0.0||g_RiskBase<=0.0)
    {
       RiskUSD=0.0;
       return;
    }
-   double rawRisk=g_HighWaterBalance*RiskPercent/100.0;
+   double rawRisk=g_RiskBase*RiskPercent/100.0;
    // Se redondea el monto hacia arriba a la unidad entera de la moneda de cuenta.
    RiskUSD=NormalizeDouble(MathMax(1.0,MathCeil(rawRisk-0.000000001)),2);
+}
+
+// Reinicia la base: vuelve al capital base con el balance actual como referencia.
+void ResetRiskBase()
+{
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   g_BaseCapital=(InpBaseCapital>0.0)?NormalizeDouble(InpBaseCapital,2):0.0;
+   g_BaseStartBalance=(balance>0.0)?balance:0.0;
+   g_BaseHighWater=g_BaseCapital;
+   SaveBaseState();
+   RecalcLots();
+   SaveState();
+   ExportStateToFile();
+   Print("🔄 Base de riesgo reiniciada: ",DoubleToString(g_BaseCapital,2)," ",AcctCur(),
+         " | balance de referencia: ",DoubleToString(g_BaseStartBalance,2)," ",AcctCur(),
+         " | riesgo: ",DoubleToString(RiskUSD,2)," ",AcctCur(),
+         " | lote: ",DoubleToString(g_Lots,2));
+}
+
+bool UseCapitalBase()
+{
+   return (InpRiskBaseMode==RISK_BASE_CAPITAL&&InpBaseCapital>0.0);
+}
+
+string RiskBaseShort()
+{
+   string cur=AcctCur();
+   if(UseCapitalBase())
+      return "BASE "+DoubleToString(g_BaseHighWater,2)+" "+cur+
+             " (capital "+DoubleToString(g_BaseCapital,2)+" + ganancias)";
+   return "MÁX. BALANCE "+DoubleToString(g_HighWaterBalance,2)+" "+cur;
+}
+
+string RiskBaseLabel()
+{
+   if(UseCapitalBase())
+      return "la base "+DoubleToString(g_BaseCapital,2)+" "+AcctCur()+" + ganancias ("+
+             DoubleToString(g_BaseHighWater,2)+" "+AcctCur()+")";
+   return "el máximo balance ("+DoubleToString(g_HighWaterBalance,2)+" "+AcctCur()+")";
 }
 
 string RiskPercentText()
@@ -684,6 +834,22 @@ string RiskPercentText()
    while(digits<8&&MathAbs(RiskPercent-NormalizeDouble(RiskPercent,digits))>0.000000001)
       digits++;
    return DoubleToString(RiskPercent,digits);
+}
+
+// Importe compacto para las celdas de la barra (la moneda se indica en la cabecera).
+string FmtMoney(double value)
+{
+   double amount=MathAbs(value);
+   if(amount>=1000000.0) return DoubleToString(value/1000000.0,2)+"M";
+   if(amount>=100000.0)  return DoubleToString(value/100000.0,1)+"K";
+   return DoubleToString(value,2);
+}
+
+string FmtLots(double lots)
+{
+   string txt=DoubleToString(lots,2);
+   if(g_LotWarn!=0) txt+=" ⚠";
+   return txt;
 }
 
 double ValuePerPoint()
@@ -717,10 +883,10 @@ double RiskPercentBalance(double lots)
    return (CalcRiskDollars(lots)/balance)*100.0;
 }
 
-double ExpectedLossPercentHighWater(double lots)
+double ExpectedLossPercentRiskBase(double lots)
 {
-   if(g_HighWaterBalance<=0.0) return 0.0;
-   return (CalcRiskDollars(lots)/g_HighWaterBalance)*100.0;
+   if(g_RiskBase<=0.0) return 0.0;
+   return (CalcRiskDollars(lots)/g_RiskBase)*100.0;
 }
 
 // Ganancia si la posición/orden llega al TP
@@ -793,26 +959,6 @@ void RecalcLots()
 {
    UpdateRiskAmount();
    g_Lots=CalcLotFromRisk(g_LotWarn);
-}
-
-// Cambia el porcentaje de riesgo y/o los puntos divisorios para calcular lote.
-void ApplyRisk(double percent,double divpts)
-{
-   if(percent>0) RiskPercent=NormalizeDouble(percent,8);
-   if(divpts>=1) RiskDivPoints=NormalizeDouble(divpts,0);
-   double old=g_Lots;
-   RecalcLots();
-   if(g_LotWarn==1)
-      Print("⚠ El lote mínimo puede superar el riesgo objetivo de ",DoubleToString(RiskUSD,2),
-            " ",AcctCur(),".");
-   if(MathAbs(g_Lots-old)>0.0000001)
-      Print("🎚 Riesgo ",RiskPercentText(),"% del máximo balance = ",
-            DoubleToString(RiskUSD,2)," ",AcctCur()," -> lote ",DoubleToString(g_Lots,2),
-            " (",_Symbol,").");
-   SaveState();
-   ExportStateToFile();
-   UpdateInfoBar();
-   RebuildActiveTab();
 }
 
 int CalcSplitCount(double totalLots)
@@ -1077,16 +1223,18 @@ void BuildStaticStructure()
    g_PanelHeight=(ActiveTab==TAB_OPERAR)?PNL_H_OPERAR:PNL_H_DETAILS;
    ObjRect(PFX+"BG",x,y,W,g_PanelHeight,C'18,18,28',C'70,70,160',2);
    ObjRect(PFX+"TITLE_BG",x,y,W,30,C'8,8,42',C'70,70,200',1);
-   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.3  ",
+   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.4  ",
           clrGold,11,"Arial Bold",ANCHOR_CENTER);
+   ObjLbl(PFX+"CUR",x+W-8,y+10,AcctCur(),C'150,150,190',7,"Arial Bold",ANCHOR_RIGHT_UPPER);
 
-   int cellW=W/3;
+   int cellW=W/IB_CELLS;
    ObjRect(PFX+"IB_BG",x,y+30,W,34,C'14,22,14',C'40,80,40',1);
-   string ibHdr[3]={"RIESGO","SI PIERDE","SI GANA"};
-   string ibObj[3]={OBJ_INFOBAR_RISK,OBJ_INFOBAR_LOSS,OBJ_INFOBAR_GAIN};
-   for(int c=0;c<3;c++)
+   string ibHdr[IB_CELLS]={"RIESGO","SI PIERDE","SI GANA","EQUIDAD","LOTE"};
+   string ibObj[IB_CELLS]={OBJ_INFOBAR_RISK,OBJ_INFOBAR_LOSS,OBJ_INFOBAR_GAIN,
+                           OBJ_INFOBAR_EQUITY,OBJ_INFOBAR_LOTS};
+   for(int c=0;c<IB_CELLS;c++)
    {
-      int cx=x+c*cellW+1,cw=(c<2)?cellW-2:W-cellW*2-2;
+      int cx=x+c*cellW+1,cw=(c<IB_CELLS-1)?cellW-2:W-cellW*(IB_CELLS-1)-2;
       ObjRect(PFX+"IB_C"+IntegerToString(c),cx,y+31,cw,32,C'20,30,20',C'40,70,40',1);
       ObjLbl(PFX+"IB_H"+IntegerToString(c),cx+cw/2,y+33,ibHdr[c],clrSilver,7,"Arial",ANCHOR_CENTER);
       ObjLbl(ibObj[c],cx+cw/2,y+42,"---",clrWhite,9,"Arial Bold",ANCHOR_CENTER);
@@ -1119,15 +1267,25 @@ void RefreshTabBar()
 
 void UpdateInfoBar()
 {
-   string cur=AcctCur();
-   double loss=CalcRiskDollars(g_Lots);
-   double gain=CalcProfitDollars(g_Lots);
-   ObjectSetString(0,OBJ_INFOBAR_RISK,OBJPROP_TEXT,StringFormat("%.2f %s",RiskUSD,cur));
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity =AccountInfoDouble(ACCOUNT_EQUITY);
+   double loss   =CalcRiskDollars(g_Lots);
+   double gain   =CalcProfitDollars(g_Lots);
+
+   ObjectSetString(0,OBJ_INFOBAR_RISK,OBJPROP_TEXT,FmtMoney(RiskUSD));
    ObjectSetInteger(0,OBJ_INFOBAR_RISK,OBJPROP_COLOR,(g_LotWarn==0)?clrGold:clrOrange);
-   ObjectSetString(0,OBJ_INFOBAR_LOSS,OBJPROP_TEXT,StringFormat("-%.2f %s",loss,cur));
+
+   ObjectSetString(0,OBJ_INFOBAR_LOSS,OBJPROP_TEXT,"-"+FmtMoney(loss));
    ObjectSetInteger(0,OBJ_INFOBAR_LOSS,OBJPROP_COLOR,clrTomato);
-   ObjectSetString(0,OBJ_INFOBAR_GAIN,OBJPROP_TEXT,StringFormat("+%.2f %s",gain,cur));
+
+   ObjectSetString(0,OBJ_INFOBAR_GAIN,OBJPROP_TEXT,"+"+FmtMoney(gain));
    ObjectSetInteger(0,OBJ_INFOBAR_GAIN,OBJPROP_COLOR,clrLimeGreen);
+
+   ObjectSetString(0,OBJ_INFOBAR_EQUITY,OBJPROP_TEXT,FmtMoney(equity));
+   ObjectSetInteger(0,OBJ_INFOBAR_EQUITY,OBJPROP_COLOR,(equity>=balance)?clrLimeGreen:clrTomato);
+
+   ObjectSetString(0,OBJ_INFOBAR_LOTS,OBJPROP_TEXT,FmtLots(g_Lots));
+   ObjectSetInteger(0,OBJ_INFOBAR_LOTS,OBJPROP_COLOR,(g_LotWarn==0)?clrWhite:clrOrange);
 }
 
 void DeleteContentObjects()
@@ -1141,7 +1299,6 @@ void DeleteContentObjects()
          if(StringFind(name,pfxList[p])==0){ObjectDelete(0,name);break;}
    }
    ObjectDelete(0,EDIT_PRICE_NAME);
-   ObjectDelete(0,EDIT_RISK_NAME);
 }
 
 void DeletePanel()
@@ -1153,7 +1310,6 @@ void DeletePanel()
       if(StringFind(name,PFX)==0) ObjectDelete(0,name);
    }
    ObjectDelete(0,EDIT_PRICE_NAME);
-   ObjectDelete(0,EDIT_RISK_NAME);
    ChartRedraw();
 }
 
@@ -1182,10 +1338,15 @@ void BuildTabOperar()
    int cx=x+8,cw=W-16;
    int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
 
-   // Porcentaje editable aplicado al máximo balance histórico.
-   ObjLbl(PFX_OP+"RISK_LABEL",cx+2,y+7,"RIESGO % · MÁX. BALANCE",clrSilver,8,"Arial Bold");
-   ObjEdit(EDIT_RISK_NAME,cx+cw-100,y,96,28,RiskPercentText(),C'30,30,48',clrGold,11);
-   y+=39;
+   // El riesgo es informativo: solo se cambia desde las Entradas (InpRiskPercent).
+   ObjRect(PFX_OP+"RISK_BG",cx,y,cw,34,C'30,28,18',C'95,90,45',1);
+   ObjLbl(PFX_OP+"RISK_L1",cx+6,y+3,
+      "RIESGO "+RiskPercentText()+"% · "+RiskBaseShort(),clrGold,8,"Arial Bold");
+   ObjLbl(PFX_OP+"RISK_L2",cx+6,y+17,
+      "Fijo: cámbialo solo en Entradas · "+DoubleToString(RiskUSD,2)+" "+AcctCur()+
+      " · lote "+DoubleToString(g_Lots,2),
+      C'160,160,190',7,"Arial");
+   y+=42;
 
    // Precio único que usan BUY LIMIT y SELL LIMIT.
    ObjLbl(PFX_OP+"LIMIT_LABEL",cx+2,y,"PRECIO PARA ORDEN LIMIT",clrSilver,8,"Arial Bold");
@@ -1230,6 +1391,10 @@ void BuildTabCuenta()
    BuildCuentaRow(PFX_ACC+"BAL",cx,y,cw,34,"BALANCE",StringFormat("%.2f %s",balance,cur),C'20,25,40',C'45,55,90',clrWhite); y+=38;
    BuildCuentaRow(PFX_ACC+"EQ",cx,y,cw,34,"EQUIDAD",StringFormat("%.2f %s",equity,cur),C'20,25,40',C'45,55,90',(equity>=balance)?clrLimeGreen:clrTomato); y+=38;
    BuildCuentaRow(PFX_ACC+"PL",cx,y,cw,34,"P&L FLOTANTE",StringFormat("%s%.2f %s",(floatPL>=0)?"+":"",floatPL,cur),C'20,25,40',C'45,55,90',(floatPL>=0)?clrLimeGreen:clrTomato); y+=38;
+   BuildCuentaRow(PFX_ACC+"BASE",cx,y,cw,34,"BASE DE RIESGO ("+RiskPercentText()+"%)",
+      StringFormat("%.2f %s",g_RiskBase,cur),C'32,30,18',C'90,85,45',clrGold); y+=38;
+   BuildCuentaRow(PFX_ACC+"LOTE",cx,y,cw,34,"LOTE PRÓXIMA OPERACIÓN",FmtLots(g_Lots),
+      C'32,30,18',C'90,85,45',(g_LotWarn==0)?clrWhite:clrOrange); y+=38;
    BuildCuentaRow(PFX_ACC+"MRG",cx,y,cw,34,"MARGEN",StringFormat("%.2f %s",margin,cur),C'20,25,40',C'45,55,90',clrOrange); y+=38;
    BuildCuentaRow(PFX_ACC+"FM",cx,y,cw,34,"LIBRE",StringFormat("%.2f %s",freeMrg,cur),C'20,25,40',C'45,55,90',(freeMrg<balance*0.20)?clrTomato:clrLimeGreen); y+=38;
 
@@ -1327,12 +1492,15 @@ void BuildTabConfig()
    string cur=AcctCur();
    double riskUSD=CalcRiskDollars(g_Lots);
    double profitUSD=CalcProfitDollars(g_Lots);
-   double pctBal=(g_HighWaterBalance>0)?(riskUSD/g_HighWaterBalance)*100.0:0.0;
+   double pctBase=(g_RiskBase>0)?(riskUSD/g_RiskBase)*100.0:0.0;
    string loteTxt=StringFormat("%.2f",g_Lots);
    if(g_LotWarn==1) loteTxt+=" ⚠MIN";
    if(g_LotWarn==2) loteTxt+=" ⚠MAX";
+   string baseModeTxt=UseCapitalBase()?"Capital base":"Balance completo";
+   string baseCapitalTxt=UseCapitalBase()?StringFormat("%.2f %s",g_BaseCapital,cur):"no aplica";
+   string baseStartTxt=(g_BaseStartBalance>0.0)?StringFormat("%.2f %s",g_BaseStartBalance,cur):"no aplica";
 
-   string cfgL[17],cfgV[17]; color cfgC[17];
+   string cfgL[CFG_ROWS],cfgV[CFG_ROWS]; color cfgC[CFG_ROWS];
    cfgL[0]="Simbolo"; cfgV[0]=_Symbol; cfgC[0]=clrWhite;
    cfgL[1]="Magic"; cfgV[1]=IntegerToString(InpMagicNumber); cfgC[1]=clrYellow;
    cfgL[2]="SL de la orden"; cfgV[2]=StringFormat("%.0f pts",SL_Points); cfgC[2]=clrTomato;
@@ -1341,23 +1509,27 @@ void BuildTabConfig()
    cfgL[5]="Riesgo por op."; cfgV[5]=StringFormat("%.2f %s / %s%%",RiskUSD,cur,RiskPercentText()); cfgC[5]=clrGold;
    cfgL[6]="SL de división"; cfgV[6]=StringFormat("%.0f pts",RiskDivPoints); cfgC[6]=clrGold;
    cfgL[7]="Lote calculado"; cfgV[7]=loteTxt; cfgC[7]=(g_LotWarn==0)?clrLimeGreen:clrOrange;
-   cfgL[8]="Pierde con SL"; cfgV[8]=StringFormat("-%.2f %s (%.2f%%)",riskUSD,cur,pctBal); cfgC[8]=clrTomato;
+   cfgL[8]="Pierde con SL"; cfgV[8]=StringFormat("-%.2f %s (%.2f%%)",riskUSD,cur,pctBase); cfgC[8]=clrTomato;
    cfgL[9]="Gana con TP"; cfgV[9]=StringFormat("+%.2f %s",profitUSD,cur); cfgC[9]=clrLimeGreen;
-   cfgL[10]="Cierre"; cfgV[10]="TP FIJO · SIN TRAILING"; cfgC[10]=clrGold;
-   cfgL[11]="Archivo estado"; cfgV[11]=g_StateFileName; cfgC[11]=clrSilver;
-   cfgL[12]="Login"; cfgV[12]=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)); cfgC[12]=clrYellow;
-   cfgL[13]="Broker"; cfgV[13]=AccountInfoString(ACCOUNT_COMPANY); cfgC[13]=clrSilver;
-   cfgL[14]="Horario de sesión";
-   cfgV[14]=InpUseSessionFilter?(InpSessionStart+" - "+InpSessionEnd):"Sin filtro";
-   cfgC[14]=InpUseSessionFilter?clrDodgerBlue:clrSilver;
-   cfgL[15]="Cierre viernes";
-   cfgV[15]=InpCloseBeforeFridayMarketEnd?StringFormat("%d min antes del mercado",InpFridayCloseMinutes):"Desactivado";
-   cfgC[15]=InpCloseBeforeFridayMarketEnd?clrGold:clrSilver;
-   cfgL[16]="Máximo balance";
-   cfgV[16]=StringFormat("%.2f %s",g_HighWaterBalance,cur);
-   cfgC[16]=clrDodgerBlue;
+   cfgL[10]="Modo de base"; cfgV[10]=baseModeTxt; cfgC[10]=UseCapitalBase()?clrGold:clrDodgerBlue;
+   cfgL[11]="Base de riesgo"; cfgV[11]=StringFormat("%.2f %s",g_RiskBase,cur); cfgC[11]=clrGold;
+   cfgL[12]="Capital base"; cfgV[12]=baseCapitalTxt; cfgC[12]=clrGold;
+   cfgL[13]="Balance de referencia"; cfgV[13]=baseStartTxt; cfgC[13]=clrSilver;
+   cfgL[14]="Cierre"; cfgV[14]="TP FIJO · SIN TRAILING"; cfgC[14]=clrGold;
+   cfgL[15]="Horario de sesión";
+   cfgV[15]=InpUseSessionFilter?(InpSessionStart+" - "+InpSessionEnd):"Sin filtro";
+   cfgC[15]=InpUseSessionFilter?clrDodgerBlue:clrSilver;
+   cfgL[16]="Cierre viernes";
+   cfgV[16]=InpCloseBeforeFridayMarketEnd?StringFormat("%d min antes del mercado",InpFridayCloseMinutes):"Desactivado";
+   cfgC[16]=InpCloseBeforeFridayMarketEnd?clrGold:clrSilver;
+   cfgL[17]="Máximo balance";
+   cfgV[17]=StringFormat("%.2f %s",g_HighWaterBalance,cur);
+   cfgC[17]=clrDodgerBlue;
+   cfgL[18]="Login"; cfgV[18]=IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)); cfgC[18]=clrYellow;
+   cfgL[19]="Broker"; cfgV[19]=AccountInfoString(ACCOUNT_COMPANY); cfgC[19]=clrSilver;
+   cfgL[20]="Archivo estado"; cfgV[20]=g_StateFileName; cfgC[20]=clrSilver;
 
-   for(int i=0;i<17;i++)
+   for(int i=0;i<CFG_ROWS;i++)
    {
       color bg=(i%2==0)?C'24,24,36':C'20,20,30';
       ObjRect(PFX_CFG+"ROW"+IntegerToString(i),cx,y,cw,20,bg,bg,0);
@@ -1367,12 +1539,15 @@ void BuildTabConfig()
    }
 
    ObjSep(PFX_CFG+"S2",cx,y,cw); y+=6;
-   ObjBtn(PFX_CFG+"SAVESTATE",cx,y,cw,24,"💾 Guardar estado",C'30,80,30',clrWhite,8,"Arial Bold");
+   int cfgBtnW=(cw-4)/2;
+   ObjBtn(PFX_CFG+"SAVESTATE",cx,y,cfgBtnW,24,"💾 Guardar estado",C'30,80,30',clrWhite,8,"Arial Bold");
+   ObjBtn(PFX_CFG+"RESETBASE",cx+cfgBtnW+4,y,cfgBtnW,24,"⟲ Reiniciar base",C'95,60,20',clrWhite,8,"Arial Bold");
    y+=30;
-   ObjRect(PFX_CFG+"NOTE_BG",cx,y,cw,44,C'24,32,24',C'50,100,50',1);
+   ObjRect(PFX_CFG+"NOTE_BG",cx,y,cw,56,C'24,32,24',C'50,100,50',1);
    ObjLbl(PFX_CFG+"NOTE1",cx+6,y+4,"Lote = monto objetivo / (pts divisor x valor punto/lote).",clrLimeGreen,7,"Arial");
-   ObjLbl(PFX_CFG+"NOTE2",cx+6,y+16,"El SL de división SOLO calcula el lote; el SL de la orden es",clrSilver,7,"Arial");
-   ObjLbl(PFX_CFG+"NOTE3",cx+6,y+28,"otro valor y el SL NUNCA se mueve (nada de trailing ni BE).",clrSilver,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE2",cx+6,y+16,"El SL de división SOLO calcula el lote; el SL de la orden es otro",clrSilver,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE3",cx+6,y+28,"y NUNCA se mueve. Riesgo = InpRiskPercent % de la base: solo",clrSilver,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE4",cx+6,y+40,"se cambia en las Entradas. La base sube con ganancias, nunca baja.",clrGold,7,"Arial");
 }
 
 //+------------------------------------------------------------------+
@@ -1437,13 +1612,6 @@ void RemoveLimitLine()
 double ReadEditPrice()
 {
    string t=ObjectGetString(0,EDIT_PRICE_NAME,OBJPROP_TEXT);
-   StringTrimLeft(t); StringTrimRight(t);
-   return StringToDouble(t);
-}
-
-double ReadEditRisk()
-{
-   string t=ObjectGetString(0,EDIT_RISK_NAME,OBJPROP_TEXT);
    StringTrimLeft(t); StringTrimRight(t);
    return StringToDouble(t);
 }
@@ -1905,6 +2073,11 @@ int OnInit()
 
    if(InpRiskPercent<=0)
       Print("⚠ InpRiskPercent debe ser mayor que cero; las entradas quedarán bloqueadas.");
+   if(InpRiskBaseMode==RISK_BASE_CAPITAL&&InpBaseCapital<=0.0)
+      Print("⚠ InpRiskBaseMode = Capital base pero InpBaseCapital es 0; se usa el balance completo.");
+   if(UseCapitalBase())
+      Print("📌 Capital base ",DoubleToString(InpBaseCapital,2)," ",AcctCur(),
+            ": el porcentaje se aplica sobre esa base mas las ganancias, no sobre el balance completo.");
    if(InpUseSessionFilter)
    {
       int sessionStart,sessionEnd;
@@ -1920,9 +2093,8 @@ int OnInit()
    // Exportar estado inicial
    ExportStateToFile();
 
-   Print("EA v5.30 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),
-         "% del máximo balance (",DoubleToString(g_HighWaterBalance,2)," ",AcctCur(),") = ",
-         DoubleToString(RiskUSD,2)," ",AcctCur()," por op",
+   Print("EA v5.40 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),"% de ",RiskBaseLabel(),
+         " = ",DoubleToString(RiskUSD,2)," ",AcctCur()," por op",
          " | SL división ", DoubleToString(RiskDivPoints,0), " pts -> lote ", DoubleToString(g_Lots,2),
          " | SL orden ", DoubleToString(SL_Points,0), " pts | TP ", DoubleToString(TP_Points,0), " pts",
          " | ", _Symbol, " | Magic: ", IntegerToString(InpMagicNumber),
@@ -1949,7 +2121,7 @@ void OnTick()
 {
    int prevCount=g_TradeCount;
    double prevLot=g_Lots;
-   double prevHighWater=g_HighWaterBalance;
+   double prevRiskBase=g_RiskBase;
    ProcessTradingSchedule();
 
    // Actualiza el máximo balance persistente y procesa comandos del Dashboard.
@@ -1974,9 +2146,9 @@ void OnTick()
    { ExportStateToFile(); g_ExportCounter = 0; }
 
    if(g_TradeCount!=prevCount||MathAbs(g_Lots-prevLot)>0.0000001||
-      MathAbs(g_HighWaterBalance-prevHighWater)>0.0000001)
+      MathAbs(g_RiskBase-prevRiskBase)>0.0000001)
    {
-      if(MathAbs(g_HighWaterBalance-prevHighWater)>0.0000001) ExportStateToFile();
+      if(MathAbs(g_RiskBase-prevRiskBase)>0.0000001) ExportStateToFile();
       RebuildActiveTab();
    }
    else if(ActiveTab==TAB_CUENTA||ActiveTab==TAB_POSIC)
@@ -1993,14 +2165,14 @@ void OnTimer()
 {
    int previousCount=g_TradeCount;
    double previousLots=g_Lots;
-   double previousHighWater=g_HighWaterBalance;
+   double previousRiskBase=g_RiskBase;
    ProcessTradingSchedule();
    RecalcLots();
    SyncAllTrades();
    FlushClosedQueue();
    UpdateInfoBar();
    if(g_TradeCount!=previousCount||MathAbs(g_Lots-previousLots)>0.0000001||
-      MathAbs(g_HighWaterBalance-previousHighWater)>0.0000001)
+      MathAbs(g_RiskBase-previousRiskBase)>0.0000001)
    {
       ExportStateToFile();
       RebuildActiveTab();
@@ -2028,14 +2200,6 @@ void OnChartEvent(const int id,const long &lparam,
      g_LimitPrice=(val>0)?NormalizeDouble(val,dg):0.0;
      GlobalVariableSet(GV_LIMIT_PRICE,g_LimitPrice);
      UpdateLimitLine(); return; }
-
-   // ── Edición del porcentaje de riesgo ──
-   if(id==CHARTEVENT_OBJECT_ENDEDIT&&sparam==EDIT_RISK_NAME)
-   { double val=ReadEditRisk();
-     if(val<=0)
-     { Print("⚠ Porcentaje inválido; se mantiene ",RiskPercentText(),"%");
-       RebuildActiveTab(); return; }
-     ApplyRisk(val,RiskDivPoints); return; }
 
    if(id==CHARTEVENT_OBJECT_DRAG&&sparam==LINE_LIMIT_NAME)
    { double linePrice=ObjectGetDouble(0,LINE_LIMIT_NAME,OBJPROP_PRICE);
@@ -2078,6 +2242,16 @@ void OnChartEvent(const int id,const long &lparam,
    if(sparam==PFX_OP+"SELLLMT"){SendLimitOrder(ORDER_TYPE_SELL_LIMIT,lots,g_LimitPrice);return;}
    if(sparam==PFX_CFG+"SAVESTATE")
    { SaveState(); ExportStateToFile(); RebuildActiveTab(); return; }
+
+   // Reinicia el capital base tomando el balance actual como referencia.
+   if(sparam==PFX_CFG+"RESETBASE")
+   {
+      if(!UseCapitalBase())
+         Print("⚠ Reiniciar base solo aplica con InpRiskBaseMode = Capital base e InpBaseCapital > 0.");
+      else
+      { ResetRiskBase(); UpdateInfoBar(); RebuildActiveTab(); }
+      return;
+   }
 
    if(sparam==PFX_POS+"SCRUP")
    {if(g_ScrollOffset>0){g_ScrollOffset--;RebuildActiveTab();}return;}
