@@ -19,7 +19,7 @@ abrevian (`100.0K`, `1.25M`) para que quepan en la celda. El valor de LOTE se pi
 cuando el broker obliga a usar su lote mínimo o máximo.
 
 Debajo, OPERAR muestra un bloque **informativo** con el riesgo activo (`RIESGO 4% · BASE ...`), el precio
-para las órdenes LIMIT y los botones BUY / SELL / BUY LIMIT / SELL LIMIT. Las pestañas CUENTA, POSIC. y
+para las órdenes LIMIT con sus botones de ayuda (`USAR ASK`, `USAR BID`, `RESET`) y los botones BUY / SELL / BUY LIMIT / SELL LIMIT. Las pestañas CUENTA, POSIC. y
 CONFIG se mantienen.
 
 ## Riesgo porcentual
