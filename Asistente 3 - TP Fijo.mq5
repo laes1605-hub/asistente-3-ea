@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                  Asistente 3 - TP Fijo.mq5   (v5.4)              |
+//|                  Asistente 3 - TP Fijo.mq5   (v5.5)              |
 //|                                                                  |
 //|   Riesgo porcentual sobre una base: el máximo balance histórico  |
 //|   (balance completo) o un capital base que arranca en un importe |
@@ -16,7 +16,7 @@
 //|   y tabs OPERAR / CUENTA / POSIC / CONFIG.                       |
 //+------------------------------------------------------------------+
 #property copyright "Gestión Cuantitativa EA"
-#property version   "5.40"
+#property version   "5.50"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -66,8 +66,8 @@ input string InpComment     = "QA_EA";
 //| CONSTANTES                                                       |
 //+------------------------------------------------------------------+
 #define PNL_W             320
-#define PNL_H_OPERAR      310
-#define PNL_H_DETAILS     650
+#define PNL_H_OPERAR      390
+#define PNL_H_DETAILS     720
 #define TAB_H             28
 #define CONTENT_Y0        96
 #define IB_CELLS          5
@@ -89,6 +89,7 @@ input string InpComment     = "QA_EA";
 string GV_RISKDIV;
 string GV_DIV_INP;
 string GV_HIGH_WATER;
+string GV_HIGH_WATER_LOCK;
 string g_HighWaterFileName;
 string GV_BASE_CAP_INP;
 string GV_BASE_START;
@@ -121,6 +122,9 @@ struct TradeRecord
 //+------------------------------------------------------------------+
 //| GLOBALES                                                         |
 //+------------------------------------------------------------------+
+string      g_LastActionMessage = "Listo. Seleccione una acción.";
+bool        g_LastActionError = false;
+datetime    g_LastActionTime = 0;
 int         ActiveTab      = TAB_OPERAR;
 double      SL_Points;          // SL real que se envía en la orden
 double      TP_Points;          // TP real que se envía en la orden
@@ -184,6 +188,11 @@ void UpdateHighWaterBalance();
 void UpdateRiskBase();
 void UpdateRiskAmount();
 void ResetRiskBase();
+void ResetHighWaterBalance();
+void DrawActionStatus();
+void SetActionStatus(string message,bool isError=false);
+bool RejectAction(string action,string reason);
+string JsonEscape(string value);
 bool UseCapitalBase();
 string RiskBaseLabel();
 string RiskBaseShort();
@@ -242,7 +251,7 @@ void ExportStateToFile()
    json += "  \"login\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n";
    json += "  \"broker\": \"" + AccountInfoString(ACCOUNT_COMPANY) + "\",\n";
    json += "  \"server\": \"" + AccountInfoString(ACCOUNT_SERVER) + "\",\n";
-   json += "  \"version\": \"5.40\",\n";
+   json += "  \"version\": \"5.50\",\n";
    json += "  \"close_mode\": \"TP_FIJO_SIN_TRAILING\",\n";
    json += "  \"session_filter_enabled\": " + (InpUseSessionFilter ? "true" : "false") + ",\n";
    json += "  \"session_start\": \"" + InpSessionStart + "\",\n";
@@ -268,6 +277,10 @@ void ExportStateToFile()
    json += "  \"lot_warning\": " + IntegerToString(g_LotWarn) + ",\n";
    json += "  \"limit_price\": " + DoubleToString(g_LimitPrice, 8) + ",\n";
    json += "  \"trailing_stop\": false,\n";
+
+   json += "  \"last_action_message\": \"" + JsonEscape(g_LastActionMessage) + "\",\n";
+   json += "  \"last_action_error\": " + (g_LastActionError?"true":"false") + ",\n";
+   json += "  \"last_action_time\": " + IntegerToString((long)g_LastActionTime) + ",\n";
 
    // Parámetros
    json += "  \"sl_points\": " + DoubleToString(SL_Points, 1) + ",\n";
@@ -502,6 +515,9 @@ void InitGlobalVarKeys()
    GV_DIV_INP          =GV_PREFIX+"DIVIN_"+suffix;
    GV_HIGH_WATER       =GV_PREFIX+"HWM_"+accountSuffix;
    g_HighWaterFileName ="GQP_HWM_"+accountSuffix+".dat";
+   GV_HIGH_WATER_LOCK  =GV_PREFIX+"HWLOCK_"+accountSuffix;
+   // Temporal: desaparece al cerrar el terminal. Nunca sobrescribe un lock existente.
+   GlobalVariableTemp(GV_HIGH_WATER_LOCK);
    GV_BASE_CAP_INP     =GV_PREFIX+"BASCAPIN_"+accountSuffix;
    GV_BASE_START       =GV_PREFIX+"BASTART_"+accountSuffix;
    GV_BASE_HIGH        =GV_PREFIX+"BASHWM_"+accountSuffix;
@@ -529,13 +545,14 @@ double LoadHighWaterBalanceFromFile()
    return value;
 }
 
-void SaveHighWaterBalanceToFile(double value)
+bool SaveHighWaterBalanceToFile(double value)
 {
-   if(value<=0.0) return;
+   if(value<0.0) return false;
    int handle=FileOpen(g_HighWaterFileName,FILE_WRITE|FILE_TXT|FILE_ANSI);
-   if(handle==INVALID_HANDLE) return;
-   FileWriteString(handle,"HIGH_WATER_BALANCE="+DoubleToString(value,2)+"\n");
+   if(handle==INVALID_HANDLE) return false;
+   uint written=FileWriteString(handle,"HIGH_WATER_BALANCE="+DoubleToString(value,2)+"\n");
    FileClose(handle);
+   return written>0;
 }
 
 // Estado del capital base: capital configurado, balance de referencia y base máxima.
@@ -602,8 +619,6 @@ void SaveState()
    UpdateRiskAmount();
    GlobalVariableSet(GV_RISKDIV,RiskDivPoints);
    GlobalVariableSet(GV_DIV_INP,InpRiskDivPoints);
-   GlobalVariableSet(GV_HIGH_WATER,g_HighWaterBalance);
-   SaveHighWaterBalanceToFile(g_HighWaterBalance);
    SaveBaseState();
    GlobalVariableSet(GV_LIMIT_PRICE,g_LimitPrice);
    SaveStateToFile();
@@ -631,13 +646,8 @@ void LoadState()
       }
    }
 
-   double fileHighWater=LoadHighWaterBalanceFromFile();
-   if(fileHighWater>g_HighWaterBalance) g_HighWaterBalance=fileHighWater;
-   if(GlobalVariableCheck(GV_HIGH_WATER))
-   {
-      double globalHighWater=GlobalVariableGet(GV_HIGH_WATER);
-      if(globalHighWater>g_HighWaterBalance) g_HighWaterBalance=globalHighWater;
-   }
+   // UpdateHighWaterBalance carga el respaldo solo si no existe la variable global.
+   // No se mezcla nunca un máximo local/archivo antiguo con un reset compartido.
    if(GlobalVariableCheck(GV_LIMIT_PRICE))
    {
       double lp=GlobalVariableGet(GV_LIMIT_PRICE);
@@ -721,23 +731,60 @@ bool LoadStateFromFile(bool loadRiskSettings)
 //+------------------------------------------------------------------+
 //| CÁLCULOS                                                        |
 //+------------------------------------------------------------------+
+// Todas las escrituras del máximo (incluido el archivo) están serializadas entre gráficos.
+// La variable global es autoritativa: un gráfico antiguo no puede deshacer un reset.
+bool LockHighWater()
+{
+   return GlobalVariableSetOnCondition(GV_HIGH_WATER_LOCK,1.0,0.0);
+}
+
+void UnlockHighWater()
+{
+   GlobalVariableSet(GV_HIGH_WATER_LOCK,0.0);
+}
+
 void UpdateHighWaterBalance()
 {
-   double currentBalance=AccountInfoDouble(ACCOUNT_BALANCE);
-   bool hasStored=GlobalVariableCheck(GV_HIGH_WATER);
-   double stored=hasStored?GlobalVariableGet(GV_HIGH_WATER):0.0;
-   double maximum=MathMax(g_HighWaterBalance,stored);
-   if(currentBalance>maximum+0.0000001)
+   if(!LockHighWater())
    {
-      maximum=currentBalance;
-      Print("📈 Nuevo máximo de balance: ",DoubleToString(maximum,2)," ",AcctCur());
+      if(GlobalVariableCheck(GV_HIGH_WATER))
+         g_HighWaterBalance=GlobalVariableGet(GV_HIGH_WATER);
+      return; // Otra instancia guarda; se reintentará en el siguiente tick/timer.
    }
-   if(maximum<=0.0&&currentBalance>0.0) maximum=currentBalance;
-   if(maximum>0.0&&(!hasStored||maximum>stored+0.0000001))
+   bool exists=GlobalVariableCheck(GV_HIGH_WATER);
+   double stored=exists?GlobalVariableGet(GV_HIGH_WATER):LoadHighWaterBalanceFromFile();
+   double maximum=MathMax(MathMax(0.0,stored),AccountInfoDouble(ACCOUNT_BALANCE));
+   if(!exists||maximum>stored)
+   {
       GlobalVariableSet(GV_HIGH_WATER,maximum);
-   if(maximum>g_HighWaterBalance+0.0000001)
-      SaveHighWaterBalanceToFile(maximum);
+      if(!SaveHighWaterBalanceToFile(maximum))
+         Print("Aviso: no se pudo guardar el respaldo del máximo; se conserva en variable global.");
+   }
    g_HighWaterBalance=maximum;
+   UnlockHighWater();
+}
+
+void ResetHighWaterBalance()
+{
+   if(!LockHighWater())
+   {
+      RejectAction("Reset máximo","otra instancia está guardando. Vuelva a pulsar el botón.");
+      return;
+   }
+   double previous=GlobalVariableCheck(GV_HIGH_WATER)?GlobalVariableGet(GV_HIGH_WATER):g_HighWaterBalance;
+   // Cero es un valor válido tras retirar todo el saldo.
+   g_HighWaterBalance=MathMax(0.0,AccountInfoDouble(ACCOUNT_BALANCE));
+   GlobalVariableSet(GV_HIGH_WATER,g_HighWaterBalance);
+   bool saved=SaveHighWaterBalanceToFile(g_HighWaterBalance);
+   GlobalVariablesFlush();
+   UnlockHighWater();
+   RecalcLots();
+   UpdateInfoBar();
+   SetActionStatus("Máximo reiniciado: "+DoubleToString(previous,2)+" -> "+
+                   DoubleToString(g_HighWaterBalance,2)+" "+AcctCur()+
+                   (UseCapitalBase()?". Capital base sin cambios.":". Riesgo y lote recalculados.")+
+                   (saved?"":" Aviso: falló el respaldo en archivo; guardado en variable global."),!saved);
+   RebuildActiveTab();
 }
 
 // Base efectiva sobre la que se aplica el porcentaje de riesgo:
@@ -896,7 +943,7 @@ double TradeGainIfTP(const TradeRecord &tr)
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(point <= 0) return 0.0;
    double pts = (tr.orderType == POSITION_TYPE_BUY || tr.orderType == ORDER_TYPE_BUY_LIMIT ||
-                 tr.orderType == ORDER_TYPE_BUY_STOP) ? (tr.tp - tr.openPrice) / point
+                 tr.orderType == ORDER_TYPE_BUY_STOP || tr.orderType == ORDER_TYPE_BUY_STOP_LIMIT) ? (tr.tp - tr.openPrice) / point
                                                       : (tr.openPrice - tr.tp) / point;
    if(pts < 0) pts = 0;
    return MoneyFromPoints(pts, tr.lots);
@@ -909,7 +956,7 @@ double TradeLossIfSL(const TradeRecord &tr)
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(point <= 0) return 0.0;
    double pts = (tr.orderType == POSITION_TYPE_BUY || tr.orderType == ORDER_TYPE_BUY_LIMIT ||
-                 tr.orderType == ORDER_TYPE_BUY_STOP) ? (tr.openPrice - tr.sl) / point
+                 tr.orderType == ORDER_TYPE_BUY_STOP || tr.orderType == ORDER_TYPE_BUY_STOP_LIMIT) ? (tr.openPrice - tr.sl) / point
                                                       : (tr.sl - tr.openPrice) / point;
    if(pts < 0) pts = 0;
    return MoneyFromPoints(pts, tr.lots);
@@ -961,24 +1008,33 @@ void RecalcLots()
    g_Lots=CalcLotFromRisk(g_LotWarn);
 }
 
-int CalcSplitCount(double totalLots)
+int VolumeDigits()
 {
-   if(totalLots <= InpMaxLotsPerOrder) return 1;
-   return (int)MathCeil(totalLots / InpMaxLotsPerOrder);
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   int digits=0;
+   while(digits<8&&MathAbs(step-NormalizeDouble(step,digits))>0.0000000001) digits++;
+   return digits;
 }
 
-double CalcSplitLot(double totalLots, int partIndex, int totalParts)
+int CalcSplitCount(double totalLots)
 {
-   double maxLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
-   double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-   double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-   double capLot  = MathMin(InpMaxLotsPerOrder, maxLot);
-   double full    = MathFloor(totalLots / capLot);
-   double rem     = totalLots - full * capLot;
-   double lot     = (partIndex < (int)full) ? capLot : ((rem > 0.0) ? rem : capLot);
-   lot = MathFloor(lot / stepLot) * stepLot;
-   lot = MathMax(lot, minLot);
-   return NormalizeDouble(lot, 2);
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(step<=0||InpMaxLotsPerOrder<=0) return 0;
+   double cap=MathFloor(MathMin(InpMaxLotsPerOrder,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX))/step+1e-8);
+   if(cap<1) return 0;
+   double units=MathFloor(totalLots/step+1e-8);
+   return (int)MathCeil(units/cap);
+}
+
+double CalcSplitLot(double totalLots,int partIndex,int totalParts)
+{
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(step<=0||totalParts<=0) return 0.0;
+   // Distribuir unidades enteras: no redondear cada parte al mínimo (aumentaría el riesgo).
+   long units=(long)MathFloor(totalLots/step+1e-8);
+   long perPart=units/totalParts;
+   long extra=units%totalParts;
+   return NormalizeDouble((perPart+(partIndex<extra?1:0))*step,VolumeDigits());
 }
 
 double CalcSL(double openPrice, int posType)
@@ -1102,8 +1158,7 @@ void SyncAllTrades()
       if(ticket==0||!OrderSelect(ticket)) continue;
       if(OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
       int otype=(int)OrderGetInteger(ORDER_TYPE);
-      if(otype!=ORDER_TYPE_BUY_LIMIT&&otype!=ORDER_TYPE_SELL_LIMIT&&
-         otype!=ORDER_TYPE_BUY_STOP&&otype!=ORDER_TYPE_SELL_STOP) continue;
+      if(!IsManagedEntryOrderType(otype,true)) continue;
       int idx=g_TradeCount; ArrayResize(g_Trades,idx+1);
       g_Trades[idx].ticket=ticket; g_Trades[idx].isPending=true;
       g_Trades[idx].orderType=otype;
@@ -1205,13 +1260,15 @@ string GetTypeName(int otype,bool isPending)
    switch(otype)
    { case ORDER_TYPE_BUY_LIMIT: return "BUY LMT"; case ORDER_TYPE_SELL_LIMIT: return "SELL LMT";
      case ORDER_TYPE_BUY_STOP: return "BUY STP"; case ORDER_TYPE_SELL_STOP: return "SELL STP";
+     case ORDER_TYPE_BUY_STOP_LIMIT: return "BUY STP LMT";
+     case ORDER_TYPE_SELL_STOP_LIMIT: return "SELL STP LMT";
      default: return "PENDING"; }
 }
 
 color GetTypeColor(int otype,bool isPending)
 {
    if(!isPending) return(otype==POSITION_TYPE_BUY)?clrLimeGreen:clrTomato;
-   return(otype==ORDER_TYPE_BUY_LIMIT||otype==ORDER_TYPE_BUY_STOP)?C'100,220,100':C'220,100,100';
+   return(otype==ORDER_TYPE_BUY_LIMIT||otype==ORDER_TYPE_BUY_STOP||otype==ORDER_TYPE_BUY_STOP_LIMIT)?C'100,220,100':C'220,100,100';
 }
 
 //+------------------------------------------------------------------+
@@ -1223,7 +1280,7 @@ void BuildStaticStructure()
    g_PanelHeight=(ActiveTab==TAB_OPERAR)?PNL_H_OPERAR:PNL_H_DETAILS;
    ObjRect(PFX+"BG",x,y,W,g_PanelHeight,C'18,18,28',C'70,70,160',2);
    ObjRect(PFX+"TITLE_BG",x,y,W,30,C'8,8,42',C'70,70,200',1);
-   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.4  ",
+   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.5  ",
           clrGold,11,"Arial Bold",ANCHOR_CENTER);
    ObjLbl(PFX+"CUR",x+W-8,y+10,AcctCur(),C'150,150,190',7,"Arial Bold",ANCHOR_RIGHT_UPPER);
 
@@ -1326,6 +1383,7 @@ void RebuildActiveTab()
    switch(ActiveTab)
    { case TAB_OPERAR: BuildTabOperar(); break; case TAB_CUENTA: BuildTabCuenta(); break;
      case TAB_POSIC: BuildTabPosiciones(); break; case TAB_CONFIG: BuildTabConfig(); break; }
+   DrawActionStatus();
    ChartRedraw();
 }
 
@@ -1448,7 +1506,11 @@ void BuildTabPosiciones()
       return;
    }
 
-   int rowH=44,maxVisible=6;
+   ObjBtn(PFX_POS+"CLOSEPAIR",cx,y,cw,26,"CERRAR TODO "+_Symbol+" (incl. pendientes)",C'140,35,25',clrWhite,8);
+   y+=30;
+   ObjLbl(PFX_POS+"SCOPE",cx+4,y,"Todo el par: incluye manuales y otros EA",clrOrange,7,"Arial");
+   y+=18;
+   int rowH=66,maxVisible=6;
    int visible=MathMin(g_TradeCount-g_ScrollOffset,maxVisible);
    for(int v=0;v<visible;v++)
    {
@@ -1461,10 +1523,10 @@ void BuildTabPosiciones()
       else {rowBg=C'30,18,18';rowBrd=C'90,35,35';}
       ObjRect(PFX_POS+"ROW"+rid,cx,y,cw,rowH-2,rowBg,rowBrd,1);
       ObjLbl(PFX_POS+"R1"+rid,cx+6,y+2,
-         StringFormat("%s #%d  %.2f lots",GetTypeName(tr.orderType,tr.isPending),(int)tr.ticket,tr.lots),
+         StringFormat("%s #%I64u  %.2f lots",GetTypeName(tr.orderType,tr.isPending),tr.ticket,tr.lots),
          GetTypeColor(tr.orderType,tr.isPending),8,"Arial Bold");
-      ObjLbl(PFX_POS+"RR"+rid,cx+cw-6,y+2,
-         StringFormat("TP +%.2f | SL -%.2f",TradeGainIfTP(tr),TradeLossIfSL(tr)),C'170,170,200',7,"Arial",ANCHOR_RIGHT_UPPER);
+      ObjLbl(PFX_POS+"RR"+rid,cx+6,y+46,
+         StringFormat("TP +%.2f | SL -%.2f",TradeGainIfTP(tr),TradeLossIfSL(tr)),C'170,170,200',7,"Arial");
       ObjLbl(PFX_POS+"R2"+rid,cx+6,y+15,
          StringFormat("P.Ap: %.*f  SL:%.*f  TP:%.*f",dg,tr.openPrice,dg,tr.sl,dg,tr.tp),clrSilver,6,"Arial");
       if(!tr.isPending)
@@ -1472,6 +1534,10 @@ void BuildTabPosiciones()
             (tr.profit>=0)?clrLimeGreen:clrTomato,9,"Arial Bold");
       else
          ObjLbl(PFX_POS+"R3"+rid,cx+6,y+27,"Esperando ejecución...",C'160,150,80',8,"Arial");
+      // El objeto lleva el ticket completo, nunca el índice de una lista que puede cambiar.
+      string action=(tr.isPending?"CANCEL_":"CLOSE_")+StringFormat("%I64u",tr.ticket);
+      ObjBtn(PFX_POS+action,cx+cw-84,y+25,78,20,tr.isPending?"Cancelar":"Cerrar",
+             C'130,40,30',clrWhite,8,"Arial");
       y+=rowH+2;
    }
 
@@ -1533,10 +1599,10 @@ void BuildTabConfig()
    for(int i=0;i<CFG_ROWS;i++)
    {
       color bg=(i%2==0)?C'24,24,36':C'20,20,30';
-      ObjRect(PFX_CFG+"ROW"+IntegerToString(i),cx,y,cw,20,bg,bg,0);
-      ObjLbl(PFX_CFG+"LH"+IntegerToString(i),cx+4,y+4,cfgL[i],clrSilver,8,"Arial");
-      ObjLbl(PFX_CFG+"LV"+IntegerToString(i),cx+cw-4,y+4,cfgV[i],cfgC[i],8,"Arial Bold",ANCHOR_RIGHT_UPPER);
-      y+=20;
+      ObjRect(PFX_CFG+"ROW"+IntegerToString(i),cx,y,cw,18,bg,bg,0);
+      ObjLbl(PFX_CFG+"LH"+IntegerToString(i),cx+4,y+3,cfgL[i],clrSilver,8,"Arial");
+      ObjLbl(PFX_CFG+"LV"+IntegerToString(i),cx+cw-4,y+3,cfgV[i],cfgC[i],8,"Arial Bold",ANCHOR_RIGHT_UPPER);
+      y+=18;
    }
 
    ObjSep(PFX_CFG+"S2",cx,y,cw); y+=6;
@@ -1544,11 +1610,13 @@ void BuildTabConfig()
    ObjBtn(PFX_CFG+"SAVESTATE",cx,y,cfgBtnW,24,"💾 Guardar estado",C'30,80,30',clrWhite,8,"Arial Bold");
    ObjBtn(PFX_CFG+"RESETBASE",cx+cfgBtnW+4,y,cfgBtnW,24,"⟲ Reiniciar base",C'95,60,20',clrWhite,8,"Arial Bold");
    y+=30;
+   ObjBtn(PFX_CFG+"RESETHWM",cx,y,cw,24,"Reiniciar máximo al balance actual",C'120,50,25',clrWhite,8,"Arial Bold");
+   y+=30;
    ObjRect(PFX_CFG+"NOTE_BG",cx,y,cw,56,C'24,32,24',C'50,100,50',1);
    ObjLbl(PFX_CFG+"NOTE1",cx+6,y+4,"Lote = monto objetivo / (pts divisor x valor punto/lote).",clrLimeGreen,7,"Arial");
    ObjLbl(PFX_CFG+"NOTE2",cx+6,y+16,"El SL de división SOLO calcula el lote; el SL de la orden es otro",clrSilver,7,"Arial");
    ObjLbl(PFX_CFG+"NOTE3",cx+6,y+28,"y NUNCA se mueve. Riesgo = InpRiskPercent % de la base: solo",clrSilver,7,"Arial");
-   ObjLbl(PFX_CFG+"NOTE4",cx+6,y+40,"se cambia en las Entradas. La base sube con ganancias, nunca baja.",clrGold,7,"Arial");
+   ObjLbl(PFX_CFG+"NOTE4",cx+6,y+40,"se cambia en Entradas. La base solo baja mediante reset manual.",clrGold,7,"Arial");
 }
 
 //+------------------------------------------------------------------+
@@ -1656,7 +1724,7 @@ void LogClosedTrade(const TradeRecord &rec)
       cp=HistoryDealGetDouble(dt,DEAL_PROFIT); found=true; break;
    }
    if(!found) return;
-   Print(StringFormat("🔚 #%d %s %.2f lots | P&L: %s%.2f %s | %s",(int)rec.ticket,_Symbol,rec.lots,
+   Print(StringFormat("🔚 #%I64u %s %.2f lots | P&L: %s%.2f %s | %s",rec.ticket,_Symbol,rec.lots,
                       (cp>=0)?"+":"",cp,AcctCur(),
                       (cp>0)?"✅ cerró en positivo (TP)":(cp<0?"⛔ cerró en negativo (SL)":"➖ neutra")));
 }
@@ -1788,17 +1856,26 @@ bool GetFridayMarketClose(datetime when,datetime &marketClose)
 
 bool CanOpenNewTrades(string actionName)
 {
+   if(!CanSendTradeRequest(actionName)) return false;
    datetime now=ServerNow();
    RecalcLots();
    if(RiskPercent<=0||RiskUSD<=0||g_Lots<=0)
+      return RejectAction(actionName,"riesgo o lote cero/inválido; revise porcentaje, base y valor del punto.");
+   if(SL_Points<=0||TP_Points<=0)
+      return RejectAction(actionName,"SL y TP deben ser mayores que cero.");
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   double minimum=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maximum=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   if(step<=0||minimum<=0||maximum<minimum||InpMaxLotsPerOrder<minimum||InpSplitDelayMs<0)
+      return RejectAction(actionName,"configuración de volumen/split inválida; revise InpMaxLotsPerOrder y demora.");
+   if(InpUseSessionFilter)
    {
-      Print("⏸ ",actionName," rechazado: porcentaje de riesgo o lote inválido.");
-      return false;
-   }
-   if(InpUseSessionFilter&&!IsWithinConfiguredSession(now))
-   {
-      Print("⏸ ",actionName," rechazado: fuera del horario configurado (hora servidor).");
-      return false;
+      int startMinute,endMinute;
+      if(!GetSessionBounds(startMinute,endMinute))
+         return RejectAction(actionName,"horario de sesión inválido; use HH:MM.");
+      if(!IsWithinConfiguredSession(now))
+         return RejectAction(actionName,"fuera de sesión "+InpSessionStart+" - "+InpSessionEnd+
+                             " (servidor: "+TimeToString(now,TIME_MINUTES)+").");
    }
    if(InpCloseBeforeFridayMarketEnd)
    {
@@ -1807,10 +1884,7 @@ bool CanOpenNewTrades(string actionName)
       {
          int minutes=(int)MathMax(1,MathMin(InpFridayCloseMinutes,1440));
          if(now>=marketClose-minutes*60)
-         {
-            Print("⏸ ",actionName," rechazado: cierre preventivo del viernes activo.");
-            return false;
-         }
+            return RejectAction(actionName,"cierre preventivo del viernes activo.");
       }
    }
    return true;
@@ -1968,82 +2042,349 @@ void ProcessTradingSchedule()
    }
 }
 
-//+------------------------------------------------------------------+
-//| TRADING                                                         |
-//+------------------------------------------------------------------+
-bool _SendSingleMarket(ENUM_ORDER_TYPE ot,double lots,double sl,double tp,ulong groupId)
+// Mensajes visibles, conservados al cambiar de pestaña y exportados al dashboard.
+string JsonEscape(string value)
 {
-   MqlTradeRequest req={}; MqlTradeResult res={};
-   req.action=TRADE_ACTION_DEAL; req.symbol=_Symbol; req.volume=lots;
-   req.type=ot; req.price=(ot==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   req.sl=sl; req.tp=tp; req.deviation=20; req.magic=InpMagicNumber;
-   req.type_filling=MarketOrderFillingMode(_Symbol);
-   req.comment=StringFormat("%s_TPF",InpComment);
-   if(!OrderSend(req,res)||res.retcode!=TRADE_RETCODE_DONE) return false;
+   StringReplace(value,"\\","\\\\");
+   StringReplace(value,"\"","\\\"");
+   StringReplace(value,"\r","\\r");
+   StringReplace(value,"\n","\\n");
+   StringReplace(value,"\t","\\t");
+   return value;
+}
+
+void DrawActionStatus()
+{
+   int x=PNL_X+6,y=PNL_Y+g_PanelHeight-76,w=PNL_W-12;
+   color fg=g_LastActionError?clrOrange:clrLimeGreen;
+   ObjRect(PFX+"STATUS_BG",x,y,w,70,C'24,24,34',fg,1);
+   string stamp=(g_LastActionTime>0?TimeToString(g_LastActionTime,TIME_SECONDS):"");
+   ObjLbl(PFX+"STATUS_TITLE",x+5,y+3,"ÚLTIMA ACCIÓN "+stamp,fg,7,"Arial Bold");
+   string remaining=g_LastActionMessage;
+   for(int i=0;i<4;i++)
+   {
+      int count=MathMin(48,StringLen(remaining));
+      if(StringLen(remaining)>count)
+         for(int k=count-1;k>20;k--)
+            if(StringSubstr(remaining,k,1)==" "){count=k;break;}
+      string line=StringSubstr(remaining,0,count);
+      remaining=StringSubstr(remaining,count);
+      StringTrimLeft(remaining);
+      if(i==3&&StringLen(remaining)>0) line+="...";
+      string name=PFX+"STATUS_"+IntegerToString(i);
+      ObjLbl(name,x+5,y+17+i*12,line,fg,7,"Arial");
+      ObjectSetString(0,name,OBJPROP_TOOLTIP,g_LastActionMessage);
+   }
+}
+
+void SetActionStatus(string message,bool isError)
+{
+   g_LastActionMessage=message;
+   g_LastActionError=isError;
+   g_LastActionTime=ServerNow();
+   Print(isError?"⚠ ":"ℹ ",_Symbol," | ",message);
+   DrawActionStatus();
+   ExportStateToFile();
+   ChartRedraw();
+}
+
+bool RejectAction(string action,string reason)
+{
+   SetActionStatus(action+" rechazado: "+reason,true);
+   return false;
+}
+
+string TradeRetcodeReason(uint code)
+{
+   switch(code)
+   {
+      case TRADE_RETCODE_REQUOTE: return "recotización; el precio cambió";
+      case TRADE_RETCODE_REJECT: return "solicitud rechazada por el broker";
+      case TRADE_RETCODE_CANCEL: return "solicitud cancelada";
+      case TRADE_RETCODE_ERROR: return "error al procesar la solicitud";
+      case TRADE_RETCODE_TIMEOUT: return "tiempo agotado; compruebe posiciones antes de reintentar";
+      case TRADE_RETCODE_INVALID: return "solicitud inválida";
+      case TRADE_RETCODE_INVALID_VOLUME: return "volumen inválido (mínimo/máximo/paso del broker)";
+      case TRADE_RETCODE_INVALID_PRICE: return "precio inválido para esta orden";
+      case TRADE_RETCODE_INVALID_STOPS: return "SL/TP o precio pendiente no respetan la distancia mínima";
+      case TRADE_RETCODE_TRADE_DISABLED: return "trading deshabilitado por el broker";
+      case TRADE_RETCODE_MARKET_CLOSED: return "mercado cerrado";
+      case TRADE_RETCODE_NO_MONEY: return "margen libre insuficiente";
+      case TRADE_RETCODE_PRICE_CHANGED: return "el precio ha cambiado";
+      case TRADE_RETCODE_PRICE_OFF: return "no hay cotizaciones disponibles";
+      case TRADE_RETCODE_INVALID_EXPIRATION: return "vencimiento de orden no permitido";
+      case TRADE_RETCODE_TOO_MANY_REQUESTS: return "demasiadas solicitudes; espere antes de reintentar";
+      case TRADE_RETCODE_SERVER_DISABLES_AT: return "el servidor bloquea el trading algorítmico";
+      case TRADE_RETCODE_CLIENT_DISABLES_AT: return "active Algo Trading en MetaTrader";
+      case TRADE_RETCODE_LOCKED: return "solicitud bloqueada/en proceso";
+      case TRADE_RETCODE_FROZEN: return "operación congelada por el broker";
+      case TRADE_RETCODE_INVALID_FILL: return "modo de ejecución no permitido";
+      case TRADE_RETCODE_CONNECTION: return "sin conexión al servidor";
+      case TRADE_RETCODE_ONLY_REAL: return "solo permitido en cuentas reales";
+      case TRADE_RETCODE_LIMIT_ORDERS: return "límite de órdenes pendientes alcanzado";
+      case TRADE_RETCODE_LIMIT_VOLUME: return "límite de volumen del símbolo alcanzado";
+      case TRADE_RETCODE_INVALID_ORDER: return "tipo de orden no permitido";
+      case TRADE_RETCODE_POSITION_CLOSED: return "la posición ya está cerrada";
+      case TRADE_RETCODE_LONG_ONLY: return "el símbolo solo permite compras";
+      case TRADE_RETCODE_SHORT_ONLY: return "el símbolo solo permite ventas";
+      case TRADE_RETCODE_CLOSE_ONLY: return "el símbolo solo permite cerrar posiciones";
+      case TRADE_RETCODE_FIFO_CLOSE: return "el broker exige cerrar primero la posición más antigua (FIFO)";
+      case TRADE_RETCODE_HEDGE_PROHIBITED: return "el broker prohíbe posiciones opuestas";
+   }
+   return "solicitud no completada; consulte el detalle del broker";
+}
+
+bool CanSendTradeRequest(string action)
+{
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      return RejectAction(action,"sin conexión al servidor.");
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return RejectAction(action,"active Algo Trading en MetaTrader.");
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return RejectAction(action,"permita trading algorítmico en las propiedades del EA.");
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return RejectAction(action,"la cuenta no permite operar (revise permisos/clave inversor).");
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return RejectAction(action,"la cuenta no permite operaciones de Expert Advisors.");
    return true;
 }
 
-bool _SendSingleLimit(ENUM_ORDER_TYPE ot,double lots,double price,double sl,double tp,ulong groupId)
+// 0 = rechazo; 1 = completada; 2 = parcial/aceptada, aún no confirmada.
+// Nunca reenviar automáticamente tras timeout o aceptación: podría duplicar la operación.
+int SendCheckedRequest(MqlTradeRequest &req,string action)
 {
-   MqlTradeRequest req={}; MqlTradeResult res={};
-   req.action=TRADE_ACTION_PENDING; req.symbol=_Symbol; req.volume=lots;
-   req.type=ot; req.price=price; req.sl=sl; req.tp=tp; req.magic=InpMagicNumber;
-   req.comment=StringFormat("%s_LMT",InpComment);
-   if(!OrderSend(req,res)||res.retcode!=TRADE_RETCODE_DONE) return false;
+   if(!CanSendTradeRequest(action)) return 0;
+   MqlTradeCheckResult check={};
+   ResetLastError();
+   bool checked=OrderCheck(req,check);
+   int error=GetLastError();
+   if(!checked||(check.retcode!=0&&check.retcode!=TRADE_RETCODE_DONE))
+   {
+      RejectAction(action,TradeRetcodeReason(check.retcode)+
+                   StringFormat(" | OrderCheck=%u, error=%d | ",check.retcode,error)+check.comment);
+      return 0;
+   }
+   MqlTradeResult result={};
+   ResetLastError();
+   bool sent=OrderSend(req,result);
+   error=GetLastError();
+   if(!sent||(result.retcode!=TRADE_RETCODE_DONE&&result.retcode!=TRADE_RETCODE_PLACED&&
+              result.retcode!=TRADE_RETCODE_DONE_PARTIAL))
+   {
+      RejectAction(action,TradeRetcodeReason(result.retcode)+
+                   StringFormat(" | retcode=%u, error=%d, externo=%d | ",result.retcode,error,result.retcode_external)+result.comment);
+      return 0;
+   }
+   // PLACED es el resultado esperado al COLOCAR una pendiente, no exige que ya se ejecute.
+   if(result.retcode==TRADE_RETCODE_PLACED&&req.action==TRADE_ACTION_PENDING) return 1;
+   if(result.retcode!=TRADE_RETCODE_DONE)
+   {
+      SetActionStatus(action+(result.retcode==TRADE_RETCODE_DONE_PARTIAL?
+                      ": ejecución parcial. Revise el volumen restante.":
+                      ": solicitud aceptada; ejecución aún no confirmada. Revise POSIC.")+
+                      StringFormat(" | retcode=%u | ",result.retcode)+result.comment,true);
+      return 2;
+   }
+   return 1;
+}
+
+// Cierres MANUALES: todo el símbolo del gráfico, independientemente de su magic.
+// No pasan por CanOpenNewTrades: los filtros de entrada no deben impedir salir.
+bool CloseSymbolTicket(ulong ticket,bool pending)
+{
+   string action=(pending?"Cancelar #":"Cerrar #")+StringFormat("%I64u",ticket);
+   MqlTradeRequest req={};
+   req.symbol=_Symbol;
+   req.magic=InpMagicNumber;
+   if(pending)
+   {
+      if(!OrderSelect(ticket)) return RejectAction(action,"la orden ya no existe; actualice POSIC.");
+      if(OrderGetString(ORDER_SYMBOL)!=_Symbol)
+         return RejectAction(action,"el ticket pertenece a otro símbolo.");
+      if(!IsManagedEntryOrderType((int)OrderGetInteger(ORDER_TYPE),true))
+         return RejectAction(action,"no es una orden pendiente cancelable.");
+      req.action=TRADE_ACTION_REMOVE;
+      req.order=ticket;
+   }
+   else
+   {
+      if(!PositionSelectByTicket(ticket)) return RejectAction(action,"la posición ya no existe; actualice POSIC.");
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)
+         return RejectAction(action,"el ticket pertenece a otro símbolo.");
+      req.action=TRADE_ACTION_DEAL;
+      req.position=ticket;
+      req.volume=PositionGetDouble(POSITION_VOLUME);
+      req.type=PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+      req.type_filling=MarketOrderFillingMode(_Symbol);
+      req.deviation=20;
+      req.comment="MANUAL_CLOSE";
+      MqlTick tick={};
+      if(!SymbolInfoTick(_Symbol,tick)||tick.ask<=0||tick.bid<=0)
+         return RejectAction(action,"no hay cotizaciones válidas para cerrar.");
+      req.price=req.type==ORDER_TYPE_SELL?tick.bid:tick.ask;
+   }
+   int result=SendCheckedRequest(req,action);
+   if(result==0) return false;
+   // DONE_PARTIAL y PLACED no equivalen a cierre total.
+   bool remains=pending?OrderSelect(ticket):PositionSelectByTicket(ticket);
+   if(result==2||remains)
+   {
+      SetActionStatus(action+": solicitud enviada, cierre/cancelación total no confirmado. Revise POSIC. antes de reintentar.",true);
+      return false;
+   }
+   SetActionStatus(action+(pending?": pendiente cancelada.":": posición cerrada."));
    return true;
+}
+
+void RefreshAfterManualTrade()
+{
+   SyncAllTrades();
+   FlushClosedQueue();
+   RecalcLots();
+   UpdateInfoBar();
+   ExportStateToFile();
+   RebuildActiveTab();
+}
+
+void CloseAllSymbolTrades()
+{
+   if(!CanSendTradeRequest("Cerrar todo "+_Symbol)) return;
+   // Snapshot de tickets: el cierre/cancelación cambia los índices del terminal.
+   // Primero pendientes para reducir el riesgo de que se ejecuten durante los cierres.
+   ulong orders[],positions[];
+   for(int i=0;i<OrdersTotal();i++)
+   {
+      ulong ticket=OrderGetTicket(i);
+      if(ticket==0||OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
+      if(!IsManagedEntryOrderType((int)OrderGetInteger(ORDER_TYPE),true)) continue;
+      int n=ArraySize(orders); ArrayResize(orders,n+1); orders[n]=ticket;
+   }
+   int done=0,failed=0,alreadyGone=0;
+   string lastFailure="";
+   for(int i=0;i<ArraySize(orders);i++)
+   {
+      if(!OrderSelect(orders[i])) {alreadyGone++;continue;}
+      if(CloseSymbolTicket(orders[i],true)) done++;
+      else {failed++;lastFailure=g_LastActionMessage;}
+   }
+   // Capturar posiciones DESPUÉS de cancelar, por si se ejecutó alguna pendiente.
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0||PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      int n=ArraySize(positions); ArrayResize(positions,n+1); positions[n]=ticket;
+   }
+   for(int i=0;i<ArraySize(positions);i++)
+   {
+      if(!PositionSelectByTicket(positions[i])) {alreadyGone++;continue;}
+      if(CloseSymbolTicket(positions[i],false)) done++;
+      else {failed++;lastFailure=g_LastActionMessage;}
+   }
+   RefreshAfterManualTrade();
+   SetActionStatus(StringFormat("Cierre %s: %d completadas, %d fallidas/sin confirmar, %d ya ausentes. ",
+                   _Symbol,done,failed,alreadyGone)+
+                   (failed>0?lastFailure:"Revise POSIC. para comprobar operaciones restantes."),failed>0);
+}
+
+
+//+------------------------------------------------------------------+
+//| TRADING                                                         |
+//+------------------------------------------------------------------+
+bool SendEntryOrder(ENUM_ORDER_TYPE ot,double lp=0.0)
+{
+   bool pending=(ot==ORDER_TYPE_BUY_LIMIT||ot==ORDER_TYPE_SELL_LIMIT);
+   bool buy=(ot==ORDER_TYPE_BUY||ot==ORDER_TYPE_BUY_LIMIT);
+   string action=pending?(buy?"BUY LIMIT":"SELL LIMIT"):(buy?"BUY":"SELL");
+   if(!CanOpenNewTrades(action)) return false;
+   long mode=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE);
+   if(mode==SYMBOL_TRADE_MODE_DISABLED||mode==SYMBOL_TRADE_MODE_CLOSEONLY)
+      return RejectAction(action,"símbolo deshabilitado o solo permite cierres.");
+   if((buy&&mode==SYMBOL_TRADE_MODE_SHORTONLY)||(!buy&&mode==SYMBOL_TRADE_MODE_LONGONLY))
+      return RejectAction(action,"el broker no permite esta dirección en el símbolo.");
+   MqlTick tick={};
+   if(!SymbolInfoTick(_Symbol,tick)||tick.ask<=0||tick.bid<=0)
+      return RejectAction(action,"no hay cotizaciones válidas para el símbolo.");
+   int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   if(pending)
+   {
+      lp=NormalizeDouble(lp,dg);
+      if(lp<=0) return RejectAction(action,"ingrese un precio válido en PRECIO PARA ORDEN LIMIT.");
+      if((buy&&lp>=tick.ask)||(!buy&&lp<=tick.bid))
+         return RejectAction(action,buy?"BUY LIMIT debe estar por debajo del ASK.":"SELL LIMIT debe estar por encima del BID.");
+   }
+   // Mantener la referencia SL/TP del asistente: precio medio para mercado, precio LIMIT para pendientes.
+   double reference=pending?lp:(tick.ask+tick.bid)/2.0;
+   double sl=NormalizeDouble(reference+(buy?-1:1)*SL_Points*point,dg);
+   double tp=NormalizeDouble(reference+(buy?1:-1)*TP_Points*point,dg);
+   double totalLots=g_Lots;
+   int parts=CalcSplitCount(totalLots),sent=0;
+   if(parts<=0) return RejectAction(action,"no se puede dividir el volumen; revise el paso y el máximo por orden.");
+   // Validar la parte más pequeña ANTES de enviar ninguna, evitando un split incompleto evitable.
+   if(CalcSplitLot(totalLots,parts-1,parts)<SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN))
+      return RejectAction(action,"el split produce lotes menores al mínimo del broker; aumente InpMaxLotsPerOrder.");
+   bool review=false;
+   string detail="";
+   for(int i=0;i<parts;i++)
+   {
+      if(i>0)
+      {
+         Sleep(InpSplitDelayMs);
+         if(!CanOpenNewTrades(action)) {detail=g_LastActionMessage;break;}
+      }
+      double partLot=CalcSplitLot(totalLots,i,parts);
+      if(partLot<SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN))
+      {
+         RejectAction(action,"el split produce un lote menor al mínimo del broker; aumente InpMaxLotsPerOrder.");
+         detail=g_LastActionMessage;
+         break;
+      }
+      MqlTradeRequest req={};
+      req.action=pending?TRADE_ACTION_PENDING:TRADE_ACTION_DEAL;
+      req.symbol=_Symbol; req.type=ot; req.volume=partLot;
+      req.sl=sl; req.tp=tp; req.magic=InpMagicNumber;
+      req.deviation=20;
+      req.type_filling=pending?ORDER_FILLING_RETURN:MarketOrderFillingMode(_Symbol);
+      req.type_time=ORDER_TIME_GTC;
+      req.comment=InpComment+(pending?"_LMT":"_TPF");
+      if(!SymbolInfoTick(_Symbol,tick)||tick.ask<=0||tick.bid<=0)
+      {
+         RejectAction(action,"se perdieron las cotizaciones durante el envío.");
+         detail=g_LastActionMessage;
+         break;
+      }
+      req.price=pending?lp:(buy?tick.ask:tick.bid);
+      int result=SendCheckedRequest(req,action);
+      if(result==0) {detail=g_LastActionMessage;break;}
+      sent++;
+      if(result==2)
+      {
+         review=true;
+         detail=g_LastActionMessage;
+         break; // No continuar el split con un resultado parcial o aún no confirmado.
+      }
+   }
+   SyncAllTrades();
+   if(sent==parts&&!review)
+      SetActionStatus(action+StringFormat(": %d/%d %s, %s lotes.",sent,parts,
+                      pending?"pendientes colocadas":"solicitudes completadas",FmtLots(totalLots)));
+   else if(sent>0)
+      SetActionStatus(action+StringFormat(": %d/%d solicitudes aceptadas. ",sent,parts)+detail+
+                      " Las partes ejecutadas no se deshacen; revise POSIC. antes de reintentar.",true);
+   else if(StringLen(detail)==0)
+      RejectAction(action,"no se envió ninguna solicitud; revise el volumen y el split.");
+   ExportStateToFile();
+   return sent>0;
 }
 
 bool SendMarketOrder(ENUM_ORDER_TYPE ot,double totalLots)
 {
-   if(!CanOpenNewTrades((ot==ORDER_TYPE_BUY)?"BUY":"SELL")) return false;
-   totalLots=g_Lots;
-   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK),bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   double mid=(ask+bid)/2.0;
-   int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
-   double sl=(ot==ORDER_TYPE_BUY)?NormalizeDouble(mid-SL_Points*point,dg):NormalizeDouble(mid+SL_Points*point,dg);
-   double tp=(ot==ORDER_TYPE_BUY)?NormalizeDouble(mid+TP_Points*point,dg):NormalizeDouble(mid-TP_Points*point,dg);
-   int parts=CalcSplitCount(totalLots);
-   ulong groupId=(ulong)TimeCurrent();
-   int sent=0;
-   for(int i=0;i<parts;i++)
-   {
-      double partLot=CalcSplitLot(totalLots,i,parts); if(partLot<=0) continue;
-      if(i>0) Sleep(InpSplitDelayMs);
-      if(_SendSingleMarket(ot,partLot,sl,tp,groupId)) sent++;
-   }
-   if(sent>0) Print("📤 ",(ot==ORDER_TYPE_BUY)?"BUY":"SELL"," ",DoubleToString(totalLots,2),
-                    " lots | SL ",DoubleToString(sl,dg)," | TP ",DoubleToString(tp,dg),
-                    " | ",(ot==ORDER_TYPE_BUY)?"+"+DoubleToString(CalcProfitDollars(totalLots),2):"-"+DoubleToString(CalcRiskDollars(totalLots),2)," ",AcctCur());
-   return (sent>0);
+   return SendEntryOrder(ot);
 }
 
 bool SendLimitOrder(ENUM_ORDER_TYPE ot,double totalLots,double lp)
 {
-   if(!CanOpenNewTrades((ot==ORDER_TYPE_BUY_LIMIT)?"BUY LIMIT":"SELL LIMIT")) return false;
-   totalLots=g_Lots;
-   int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
-   if(lp<=0)
-   {
-      Print("⚠ Ingrese un precio válido en el campo PRECIO PARA ORDEN LIMIT.");
-      return false;
-   }
-   lp=NormalizeDouble(lp,dg);
-   double sl=(ot==ORDER_TYPE_BUY_LIMIT||ot==ORDER_TYPE_BUY_STOP)?NormalizeDouble(lp-SL_Points*point,dg):NormalizeDouble(lp+SL_Points*point,dg);
-   double tp=(ot==ORDER_TYPE_BUY_LIMIT||ot==ORDER_TYPE_BUY_STOP)?NormalizeDouble(lp+TP_Points*point,dg):NormalizeDouble(lp-TP_Points*point,dg);
-   int parts=CalcSplitCount(totalLots);
-   ulong groupId=(ulong)TimeCurrent();
-   int sent=0;
-   for(int i=0;i<parts;i++)
-   {
-      double partLot=CalcSplitLot(totalLots,i,parts); if(partLot<=0) continue;
-      if(i>0) Sleep(InpSplitDelayMs);
-      if(_SendSingleLimit(ot,partLot,lp,sl,tp,groupId)) sent++;
-   }
-   if(sent>0) Print("📤 ",(ot==ORDER_TYPE_BUY_LIMIT)?"BUY LIMIT":"SELL LIMIT"," ",DoubleToString(totalLots,2),
-                    " lots @ ",DoubleToString(lp,dg)," | SL ",DoubleToString(sl,dg)," | TP ",DoubleToString(tp,dg));
-   return (sent>0);
+   return SendEntryOrder(ot,lp);
 }
 
 
@@ -2094,7 +2435,7 @@ int OnInit()
    // Exportar estado inicial
    ExportStateToFile();
 
-   Print("EA v5.40 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),"% de ",RiskBaseLabel(),
+   Print("EA v5.50 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),"% de ",RiskBaseLabel(),
          " = ",DoubleToString(RiskUSD,2)," ",AcctCur()," por op",
          " | SL división ", DoubleToString(RiskDivPoints,0), " pts -> lote ", DoubleToString(g_Lots,2),
          " | SL orden ", DoubleToString(SL_Points,0), " pts | TP ", DoubleToString(TP_Points,0), " pts",
@@ -2123,6 +2464,7 @@ void OnTick()
    int prevCount=g_TradeCount;
    double prevLot=g_Lots;
    double prevRiskBase=g_RiskBase;
+   double prevHighWater=g_HighWaterBalance;
    ProcessTradingSchedule();
 
    // Actualiza el máximo balance persistente y procesa comandos del Dashboard.
@@ -2147,9 +2489,11 @@ void OnTick()
    { ExportStateToFile(); g_ExportCounter = 0; }
 
    if(g_TradeCount!=prevCount||MathAbs(g_Lots-prevLot)>0.0000001||
-      MathAbs(g_RiskBase-prevRiskBase)>0.0000001)
+      MathAbs(g_RiskBase-prevRiskBase)>0.0000001||
+      MathAbs(g_HighWaterBalance-prevHighWater)>0.0000001)
    {
-      if(MathAbs(g_RiskBase-prevRiskBase)>0.0000001) ExportStateToFile();
+      if(MathAbs(g_RiskBase-prevRiskBase)>0.0000001||
+         MathAbs(g_HighWaterBalance-prevHighWater)>0.0000001) ExportStateToFile();
       RebuildActiveTab();
    }
    else if(ActiveTab==TAB_CUENTA||ActiveTab==TAB_POSIC)
@@ -2167,13 +2511,15 @@ void OnTimer()
    int previousCount=g_TradeCount;
    double previousLots=g_Lots;
    double previousRiskBase=g_RiskBase;
+   double previousHighWater=g_HighWaterBalance;
    ProcessTradingSchedule();
    RecalcLots();
    SyncAllTrades();
    FlushClosedQueue();
    UpdateInfoBar();
    if(g_TradeCount!=previousCount||MathAbs(g_Lots-previousLots)>0.0000001||
-      MathAbs(g_RiskBase-previousRiskBase)>0.0000001)
+      MathAbs(g_RiskBase-previousRiskBase)>0.0000001||
+      MathAbs(g_HighWaterBalance-previousHighWater)>0.0000001)
    {
       ExportStateToFile();
       RebuildActiveTab();
@@ -2243,6 +2589,39 @@ void OnChartEvent(const int id,const long &lparam,
    if(sparam==PFX_OP+"SELLLMT"){SendLimitOrder(ORDER_TYPE_SELL_LIMIT,lots,g_LimitPrice);return;}
    if(sparam==PFX_CFG+"SAVESTATE")
    { SaveState(); ExportStateToFile(); RebuildActiveTab(); return; }
+
+   if(sparam==PFX_CFG+"RESETHWM")
+   {
+      if(MessageBox("¿Reiniciar el máximo histórico al balance actual de "+
+                    DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+" "+AcctCur()+
+                    "?\nAfecta a los gráficos de esta cuenta en este terminal.\n"+
+                    "No cierra operaciones ni reinicia el capital base.",
+                    "Confirmar reset del máximo",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)==IDYES)
+         ResetHighWaterBalance();
+      return;
+   }
+   if(sparam==PFX_POS+"CLOSEPAIR")
+   {
+      if(MessageBox("¿Cerrar TODAS las posiciones y cancelar TODAS las pendientes de "+_Symbol+
+                    "?\nIncluye operaciones manuales y de otros EA. No afecta a otros símbolos.",
+                    "Confirmar cierre del par",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)==IDYES)
+         CloseAllSymbolTrades();
+      return;
+   }
+   bool cancel=(StringFind(sparam,PFX_POS+"CANCEL_")==0);
+   if(cancel||StringFind(sparam,PFX_POS+"CLOSE_")==0)
+   {
+      string prefix=PFX_POS+(cancel?"CANCEL_":"CLOSE_");
+      ulong ticket=(ulong)StringToInteger(StringSubstr(sparam,StringLen(prefix)));
+      if(MessageBox((cancel?"¿Cancelar pendiente #":"¿Cerrar posición #")+
+                    StringFormat("%I64u",ticket)+" de "+_Symbol+"?",
+                    "Confirmar operación",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)==IDYES)
+      {
+         CloseSymbolTicket(ticket,cancel);
+         RefreshAfterManualTrade();
+      }
+      return;
+   }
 
    // Reinicia el capital base tomando el balance actual como referencia.
    if(sparam==PFX_CFG+"RESETBASE")
