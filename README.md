@@ -1,6 +1,96 @@
 # Asistente 3 EA
 
-La versión de riesgo porcentual es `Asistente 3 - TP Fijo.mq5` (v5.40).
+La versión de riesgo porcentual es `Asistente 3 - TP Fijo.mq5` (v5.51).
+
+
+## Novedad v5.51: lotaje redondeado hacia arriba
+
+El resultado de `monto objetivo / (puntos divisor × valor por punto por lote)` se redondea **hacia
+arriba al siguiente paso de volumen permitido por el broker**, no al siguiente lote entero:
+
+- Paso `0.01`: `1.231 → 1.24`; `1.23 → 1.23`.
+- Paso `0.001`: `0.1231 → 0.124`.
+- Paso `0.25`: `1.26 → 1.50`.
+
+Los múltiplos exactos se conservan (también cuando la división introduce ruido de coma flotante).
+Se siguen respetando los límites de volumen: si el resultado queda debajo del mínimo se usa el mínimo;
+si supera el máximo se limita al máximo y se muestra la advertencia correspondiente. El split conserva
+el total calculado, sin redondear cada parte de nuevo hacia arriba.
+
+**El redondeo hacia arriba puede aumentar el riesgo real respecto al importe objetivo.** Revisa
+**SI PIERDE** para ver la pérdida estimada con el lote y el SL de la orden. El redondeo del importe
+objetivo a la unidad monetaria superior no cambia.
+
+## Novedades v5.50: reset, cierres manuales y diagnóstico
+
+### Reiniciar el máximo histórico
+
+En **CONFIG → Reiniciar máximo al balance actual**, confirma el aviso. El máximo pasa al
+**balance actual de la cuenta** (no a la equidad ni a cero, salvo que el balance sea cero).
+Por ejemplo: máximo 1,200, balance tras un retiro 800 → nuevo máximo 800; con riesgo del 4%,
+el objetivo pasa de 48 a 32. Desde ese momento vuelve a subir cuando el balance supere el nuevo máximo.
+
+- Recalcula riesgo y lote, sin cerrar posiciones ni cambiar sus SL/TP.
+- Se guarda en la variable global de cuenta y en `MQL5/Files/GQP_HWM_*.dat`.
+- Se comparte entre símbolos y magic numbers de la misma cuenta/servidor/moneda **en el mismo terminal**.
+  Los demás gráficos recogen el cambio en el siguiente tick/temporizador, incluso al guardar o salir.
+- Es distinto de **Reiniciar base**: en modo capital base, reiniciar el máximo histórico **no** modifica
+  el capital base ni su referencia. Usa el botón de base si lo que deseas es reiniciar ese cálculo.
+- Actualiza **todas** las instancias de TP Fijo a v5.50: una versión antigua no conoce la nueva sincronización.
+- Si no puede guardar el respaldo en archivo, lo avisa; el valor queda en la variable global del terminal.
+
+### Cerrar operaciones del par
+
+En **POSIC.**, cada posición tiene **Cerrar** y cada pendiente tiene **Cancelar**. El botón
+**CERRAR TODO [símbolo] (incl. pendientes)** cancela las pendientes y cierra las posiciones del par.
+Todas estas acciones piden confirmación (la opción predeterminada es No).
+
+**Alcance de los cierres manuales:** todas las operaciones del símbolo del gráfico, incluidas las
+manuales y las de otros EA/magic numbers. **No toca otros símbolos.** Abarca pendientes LIMIT, STOP
+y STOP LIMIT. Los cierres automáticos del viernes siguen limitados al símbolo + magic del EA.
+
+El cierre individual usa el ticket completo, no el número de fila, para no cerrar otra operación
+si cambia la lista. En cuentas *hedging* permite cerrar cada posición por separado; en cuentas
+*netting* MetaTrader consolida las entradas del símbolo en una única posición y se cierra esa posición completa.
+Los filtros de sesión y de entrada del viernes no bloquean estos cierres manuales, pero siguen siendo
+necesarios conexión, permisos de trading y un mercado que permita ejecutarlos.
+
+Un rechazo, una ejecución parcial o una solicitud todavía sin confirmar **no se anuncian como cierre total**.
+El cierre del par intenta el resto de tickets y muestra un resumen con el último fallo; el registro
+conserva el detalle de cada uno. Revisa POSIC. antes de repetir: no hay reenvíos automáticos y otro EA
+podría volver a abrir operaciones por su cuenta.
+
+### Por qué no abre una operación
+
+La franja **ÚLTIMA ACCIÓN**, visible en todas las pestañas, muestra el resultado y conserva el último
+mensaje mientras el EA está activo. Si no cabe, coloca el cursor sobre el texto para ver el mensaje
+completo; también aparece en **Caja de herramientas → Expertos**.
+
+Se comprueban permisos/Algo Trading, conexión, riesgo/lote, configuración del split, SL/TP positivos,
+horario, cierre preventivo del viernes, dirección permitida y precio LIMIT (BUY debajo de ASK,
+SELL encima de BID). Antes de enviar se ejecuta `OrderCheck`; los rechazos incluyen el motivo, código
+MT5, error local y comentario del broker: margen insuficiente, mercado cerrado, volumen inválido,
+SL/TP demasiado cercanos, modo de ejecución no admitido, etc.
+
+En operaciones divididas, se valida que ninguna parte quede por debajo del mínimo antes de enviar.
+Si falla una parte, o una entrada a mercado queda parcial/sin confirmar, se detiene el resto y se indica
+cuántas solicitudes fueron aceptadas. **Las partes ya ejecutadas no se deshacen**: revisa POSIC. antes
+de volver a pulsar BUY/SELL. La aceptación de una LIMIT significa que se colocó la pendiente, no que
+ya se haya ejecutado.
+
+El JSON añade `last_action_message`, `last_action_error` y `last_action_time` (hora del servidor como
+entero `datetime` de MQL5). El texto se escapa para admitir comentarios del broker con comillas o saltos de línea.
+
+### Instalación y validación
+
+1. Abre **`Asistente 3 - TP Fijo.mq5`** en MetaEditor y compila con **F7**.
+2. Usa el nuevo **`Asistente 3 - TP Fijo.ex5`** en los gráficos; el `Asistente 3.ex5` del repositorio
+   corresponde a otra versión y **no** contiene estos cambios. `Asistente 3.mq5` tampoco se ha modificado.
+3. Prueba primero en demo siguiendo [la lista de comprobación](tests/MT5_CHECKLIST.md).
+
+Pruebas locales: `python -m unittest discover -s tests -v` (Python 3 y `g++`). Revisan contratos del
+código y ejecutan funciones extraídas con API de terminal simulada. **No sustituyen la compilación
+MQL5, el Strategy Tester ni las pruebas con el broker.** No se genera un `.ex5` en este entorno.
 
 ## Panel OPERAR
 
@@ -27,9 +117,9 @@ CONFIG se mantienen.
 `InpRiskPercent` es el porcentaje que se arriesga por operación (por defecto, 4%). **Solo se puede cambiar
 en las Entradas de MetaTrader**: el panel ya no tiene campo editable y los comandos del dashboard
 (`set_risk_percent` / `set_risk_usd`) se ignoran con un aviso en el log. El monto objetivo se redondea hacia
-arriba a la unidad entera de la moneda de la cuenta (4% de 1,001 = 40.04 → 41); el lote se ajusta hacia abajo
-al paso del broker. Si el lote mínimo supera el objetivo, se usa el mínimo y se indica la advertencia
-correspondiente.
+arriba a la unidad entera de la moneda de la cuenta (4% de 1,001 = 40.04 → 41); el lote se ajusta hacia arriba
+al paso del broker, conservando los múltiplos exactos. Si el lote mínimo supera el objetivo, se usa el mínimo
+y se indica la advertencia correspondiente.
 
 ## Base de cálculo del riesgo
 
