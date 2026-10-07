@@ -1,18 +1,18 @@
-# Validación v5.50 en MetaTrader 5 (cuenta DEMO)
+# Validación v5.51 en MetaTrader 5 (cuenta DEMO)
 
 Pendiente de ejecutar en MT5: el entorno de desarrollo no dispone de MetaEditor ni del terminal.
 
 ## Compilación y panel
 
 - [ ] Compilar `Asistente 3 - TP Fijo.mq5` con F7. Verificar que no hay errores y revisar las advertencias.
-- [ ] Cargar el `.ex5` recién generado y comprobar v5.5 en el título.
+- [ ] Cargar el `.ex5` recién generado y comprobar v5.51 en el título.
 - [ ] Recorrer OPERAR/CUENTA/POSIC./CONFIG; comprobar que los botones y la franja de mensajes no se solapan.
 - [ ] Probar POSIC. con 0, 1 y más de 6 operaciones, scroll y tickets largos.
 - [ ] Si la ventana es pequeña, ajustar `InpPanelY` para ver el panel completo.
 
 ## Reset del máximo
 
-- [ ] Abrir dos gráficos de símbolos distintos, misma cuenta, ambos con v5.50 y distinto magic.
+- [ ] Abrir dos gráficos de símbolos distintos, misma cuenta, ambos con v5.51 y distinto magic.
 - [ ] Con máximo guardado mayor que el saldo, cancelar el diálogo de reset: nada debe cambiar.
 - [ ] Confirmar reset: máximo = balance, no equidad; riesgo redondeado y lote recalculados.
 - [ ] Verificar el otro gráfico tras su siguiente timer, guardar su estado, retirarlo y volver a cargarlo:
@@ -51,3 +51,13 @@ Pendiente de ejecutar en MT5: el entorno de desarrollo no dispone de MetaEditor 
 - [ ] Split que falla después de aceptar una parte: detenerse, conservar posiciones ejecutadas y advertir antes de reintentar.
 - [ ] Cambiar de pestaña y esperar ticks/timer: el último mensaje no se pierde.
 - [ ] Leer JSON con un parser: campos de mensaje/código de error lógico/hora presentes; comillas del comentario escapadas.
+
+## Redondeo del lotaje v5.51
+
+- [ ] Paso 0.01, cociente 1.231: lote 1.24. Cociente exacto 1.23: conservar 1.23.
+- [ ] Paso 0.001, cociente 0.1231: lote 0.124. Paso 0.25, cociente 1.26: lote 1.50.
+- [ ] Paso 1, cociente 1.23: lote 2 (solo porque ese es el paso exigido por el símbolo).
+- [ ] Cociente exacto tras varias divisiones: no añadir un paso por ruido de coma flotante.
+- [ ] Respetar mínimo/máximo y conservar sus advertencias al limitar el lote.
+- [ ] Comprobar que SI PIERDE, SI GANA, LOTE y JSON reflejan el lote nuevo; el riesgo real puede aumentar.
+- [ ] Mercado y LIMIT usan el mismo lote; la suma de las partes del split conserva el total redondeado.

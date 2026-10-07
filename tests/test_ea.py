@@ -99,7 +99,7 @@ class ExtractedLogic(unittest.TestCase):
     @unittest.skipUnless(shutil.which("g++"), "Requiere g++ para ejecutar el subconjunto compatible")
     def test_actual_mql_functions_with_terminal_mocks(self):
         names = ["LockHighWater", "UnlockHighWater", "UpdateHighWaterBalance", "ResetHighWaterBalance",
-                 "VolumeDigits", "CalcSplitCount", "CalcSplitLot", "TradeRetcodeReason",
+                 "CalcLotFromRisk", "VolumeDigits", "CalcSplitCount", "CalcSplitLot", "TradeRetcodeReason",
                  "CanSendTradeRequest", "SendCheckedRequest", "CloseSymbolTicket"]
         extracted = '\n\n'.join(function(name) for name in names)
         harness = (ROOT / 'tests' / 'terminal_harness.cpp').read_text()

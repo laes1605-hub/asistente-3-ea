@@ -1,6 +1,7 @@
 // Harness de API, no un EA ni una compilación MQL5 completa.
 #include <cassert>
 #include <cmath>
+#include <cfloat>
 #include <iostream>
 #include <map>
 #include <string>
@@ -9,6 +10,8 @@ using string = std::string;
 string GV_HIGH_WATER="hwm",GV_HIGH_WATER_LOCK="lock",_Symbol="EURUSD";
 std::map<string,double> globals;
 double balance=1000,backup=0,g_HighWaterBalance=0,step=.01,minimum=.01,maximum=100,InpMaxLotsPerOrder=100;
+double RiskUSD=100,RiskPercent=4,RiskDivPoints=100,vpp=1;
+double ValuePerPoint(){return vpp;}
 long InpMagicNumber=123;
 bool persistOK=true,capital=false,statusError=false;
 int backupReads=0,backupWrites=0,recalcs=0,sends=0,checks=0,deniedPermission=-1;
@@ -18,6 +21,7 @@ double MathMin(double a,double b){return std::fmin(a,b);}
 double MathAbs(double n){return std::fabs(n);}
 double MathFloor(double n){return std::floor(n);}
 double MathCeil(double n){return std::ceil(n);}
+double MathRound(double n){return std::round(n);}
 double NormalizeDouble(double n,int digits){double p=std::pow(10,digits);return std::round(n*p)/p;}
 bool GlobalVariableCheck(string key){return globals.count(key);}
 double GlobalVariableGet(string key){return globals.at(key);}
@@ -101,6 +105,45 @@ int main(){
     g_HighWaterBalance=2000;UpdateHighWaterBalance();assert(g_HighWaterBalance==700&&backupWrites==writes);
     globals[GV_HIGH_WATER_LOCK]=0;persistOK=false;ResetHighWaterBalance();
     assert(statusError&&globals[GV_HIGH_WATER]==500&&globals[GV_HIGH_WATER_LOCK]==0);
+    // Ejecutar la función real de riesgo -> lote con diferentes pasos del broker.
+    auto expectLot=[](double raw,double expected,int expectedWarning=0){
+        RiskUSD=raw*(RiskDivPoints*vpp);int warning=-1;
+        double lot=CalcLotFromRisk(warning);
+        assert(std::abs(lot-expected)<1e-10&&warning==expectedWarning);
+    };
+    step=.01;minimum=.01;maximum=100;
+    expectLot(.001,.01,1);expectLot(.01,.01);
+    expectLot(1.231,1.24);expectLot(1.23,1.23);expectLot(1.230000001,1.24);
+    expectLot(1.229999999,1.23);expectLot(.23,.23);expectLot(1.1,1.1);
+    step=.001;minimum=.001;expectLot(.1231,.124);expectLot(.123,.123);
+    step=.1;minimum=.1;expectLot(1.231,1.3);expectLot(1.2,1.2);
+    step=.25;minimum=.25;expectLot(1.231,1.25);expectLot(1.25,1.25);expectLot(1.251,1.5);
+    step=1;minimum=1;expectLot(1.231,2);expectLot(2,2);expectLot(.23,1,1);
+    step=.01;minimum=.1;expectLot(.021,.1,1);
+    minimum=.01;maximum=.07;expectLot(.07,.07);expectLot(.071,.07,2);
+    maximum=100;
+    // Invalidaciones existentes no deben producir lotes por el redondeo.
+    RiskUSD=0;int warning=-1;assert(CalcLotFromRisk(warning)==0&&warning==0);
+    RiskUSD=100;RiskPercent=0;assert(CalcLotFromRisk(warning)==0);RiskPercent=4;
+    vpp=0;assert(CalcLotFromRisk(warning)==0);vpp=1;
+    RiskDivPoints=0;assert(CalcLotFromRisk(warning)==0);RiskDivPoints=100;
+    // Propiedad: mínimo múltiplo >= cociente, sin sumar otro paso a los exactos.
+    for(double st:{.001,.01,.1,.25,1.}){
+        step=st;minimum=st;maximum=1000;
+        for(int n=1;n<150;n++){
+            expectLot(n*st,n*st);
+            expectLot((n+.001)*st,(n+1)*st);
+            expectLot((n+.5)*st,(n+1)*st);
+            expectLot((n+.999)*st,(n+1)*st);
+        }
+    }
+    // El split conserva el total ya redondeado, no vuelve a redondear cada parte.
+    step=.01;minimum=.01;maximum=100;InpMaxLotsPerOrder=.5;
+    RiskUSD=1.231*(RiskDivPoints*vpp);double rounded=CalcLotFromRisk(warning);
+    assert(std::abs(rounded-1.24)<1e-10);
+    int pieces=CalcSplitCount(rounded);double splitTotal=0;
+    for(int i=0;i<pieces;i++)splitTotal+=CalcSplitLot(rounded,i,pieces);
+    assert(pieces==3&&std::abs(splitTotal-rounded)<1e-10);
     // Splits conservan el volumen, paso y límite, incluso con tres decimales.
     for(double st:{.001,.01,.1,.25}){
         step=st;

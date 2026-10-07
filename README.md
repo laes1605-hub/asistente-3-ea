@@ -1,7 +1,25 @@
 # Asistente 3 EA
 
-La versión de riesgo porcentual es `Asistente 3 - TP Fijo.mq5` (v5.50).
+La versión de riesgo porcentual es `Asistente 3 - TP Fijo.mq5` (v5.51).
 
+
+## Novedad v5.51: lotaje redondeado hacia arriba
+
+El resultado de `monto objetivo / (puntos divisor × valor por punto por lote)` se redondea **hacia
+arriba al siguiente paso de volumen permitido por el broker**, no al siguiente lote entero:
+
+- Paso `0.01`: `1.231 → 1.24`; `1.23 → 1.23`.
+- Paso `0.001`: `0.1231 → 0.124`.
+- Paso `0.25`: `1.26 → 1.50`.
+
+Los múltiplos exactos se conservan (también cuando la división introduce ruido de coma flotante).
+Se siguen respetando los límites de volumen: si el resultado queda debajo del mínimo se usa el mínimo;
+si supera el máximo se limita al máximo y se muestra la advertencia correspondiente. El split conserva
+el total calculado, sin redondear cada parte de nuevo hacia arriba.
+
+**El redondeo hacia arriba puede aumentar el riesgo real respecto al importe objetivo.** Revisa
+**SI PIERDE** para ver la pérdida estimada con el lote y el SL de la orden. El redondeo del importe
+objetivo a la unidad monetaria superior no cambia.
 
 ## Novedades v5.50: reset, cierres manuales y diagnóstico
 
@@ -99,9 +117,9 @@ CONFIG se mantienen.
 `InpRiskPercent` es el porcentaje que se arriesga por operación (por defecto, 4%). **Solo se puede cambiar
 en las Entradas de MetaTrader**: el panel ya no tiene campo editable y los comandos del dashboard
 (`set_risk_percent` / `set_risk_usd`) se ignoran con un aviso en el log. El monto objetivo se redondea hacia
-arriba a la unidad entera de la moneda de la cuenta (4% de 1,001 = 40.04 → 41); el lote se ajusta hacia abajo
-al paso del broker. Si el lote mínimo supera el objetivo, se usa el mínimo y se indica la advertencia
-correspondiente.
+arriba a la unidad entera de la moneda de la cuenta (4% de 1,001 = 40.04 → 41); el lote se ajusta hacia arriba
+al paso del broker, conservando los múltiplos exactos. Si el lote mínimo supera el objetivo, se usa el mínimo
+y se indica la advertencia correspondiente.
 
 ## Base de cálculo del riesgo
 

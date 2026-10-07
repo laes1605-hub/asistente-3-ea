@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                  Asistente 3 - TP Fijo.mq5   (v5.5)              |
+//|                  Asistente 3 - TP Fijo.mq5   (v5.51)              |
 //|                                                                  |
 //|   Riesgo porcentual sobre una base: el máximo balance histórico  |
 //|   (balance completo) o un capital base que arranca en un importe |
@@ -9,14 +9,14 @@
 //|   El monto se redondea hacia arriba a la unidad entera de la     |
 //|   cuenta y la base nunca disminuye, incluso tras pérdidas.       |
 //|   El lote se calcula con el divisor de puntos y se ajusta hacia  |
-//|   abajo al paso del broker cuando el lote mínimo lo permite.     |
+//|   arriba al paso del broker, respetando su mínimo y máximo.      |
 //|   El SL/TP de cada operación siguen siendo fijos; no hay trailing.|
 //|   Del resto, igual que el original: linea de limite, split de    |
 //|   lotes, enforce de SL/TP, JSON para el dashboard, persistencia  |
 //|   y tabs OPERAR / CUENTA / POSIC / CONFIG.                       |
 //+------------------------------------------------------------------+
 #property copyright "Gestión Cuantitativa EA"
-#property version   "5.50"
+#property version   "5.51"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -251,7 +251,7 @@ void ExportStateToFile()
    json += "  \"login\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n";
    json += "  \"broker\": \"" + AccountInfoString(ACCOUNT_COMPANY) + "\",\n";
    json += "  \"server\": \"" + AccountInfoString(ACCOUNT_SERVER) + "\",\n";
-   json += "  \"version\": \"5.50\",\n";
+   json += "  \"version\": \"5.51\",\n";
    json += "  \"close_mode\": \"TP_FIJO_SIN_TRAILING\",\n";
    json += "  \"session_filter_enabled\": " + (InpUseSessionFilter ? "true" : "false") + ",\n";
    json += "  \"session_start\": \"" + InpSessionStart + "\",\n";
@@ -979,8 +979,8 @@ string AcctCur()
 }
 
 // Lote a partir del monto objetivo y los puntos divisores.
-// Se redondea HACIA ABAJO al paso del símbolo; si el broker exige su lote mínimo
-// y este supera el objetivo, se usa el mínimo y se activa g_LotWarn.
+// Se redondea HACIA ARRIBA al paso del símbolo, conservando múltiplos exactos.
+// Se respetan mínimo/máximo; el redondeo puede aumentar el riesgo sobre el objetivo.
 double CalcLotFromRisk(int &warn)
 {
    warn = 0;
@@ -993,12 +993,22 @@ double CalcLotFromRisk(int &warn)
    if(minLot  <= 0) minLot  = 0.01;
 
    double raw = RiskUSD / (RiskDivPoints * vpp);
-   double lot = MathFloor(raw / stepLot) * stepLot;
-   if(lot < minLot) { lot = minLot; warn = 1; }
-   if(maxLot > 0 && lot > maxLot) { lot = maxLot; warn = 2; }
+   double units = raw / stepLot;
+   // Corregir solo ruido de coma flotante: 110.00000000000001 pasos son 110,
+   // no 111. Una fracción real por encima del paso siempre sube al siguiente.
+   double nearest = MathRound(units);
+   double tolerance = 8.0 * DBL_EPSILON * MathMax(1.0,MathAbs(units));
+   if(MathAbs(units-nearest)<=tolerance) units=nearest;
+   double lot = MathCeil(units) * stepLot;
    int vdg=0;
    while(vdg<8&&MathAbs(stepLot-NormalizeDouble(stepLot,vdg))>0.0000000001)
       vdg++;
+   // Normalizar antes de comparar límites evita falsas alertas en un máximo exacto.
+   lot=NormalizeDouble(lot,vdg);
+   if(lot < minLot) { lot = minLot; warn = 1; }
+   // Conservar el aviso de mínimo aunque el redondeo ya haya llegado a ese lote.
+   if(units < minLot / stepLot - tolerance) warn = 1;
+   if(maxLot > 0 && lot > maxLot) { lot = maxLot; warn = 2; }
    return NormalizeDouble(lot,vdg);
 }
 
@@ -1280,7 +1290,7 @@ void BuildStaticStructure()
    g_PanelHeight=(ActiveTab==TAB_OPERAR)?PNL_H_OPERAR:PNL_H_DETAILS;
    ObjRect(PFX+"BG",x,y,W,g_PanelHeight,C'18,18,28',C'70,70,160',2);
    ObjRect(PFX+"TITLE_BG",x,y,W,30,C'8,8,42',C'70,70,200',1);
-   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.5  ",
+   ObjLbl(OBJ_TITLE,x+W/2,y+7,"  ASISTENTE 3 · TP FIJO  v5.51  ",
           clrGold,11,"Arial Bold",ANCHOR_CENTER);
    ObjLbl(PFX+"CUR",x+W-8,y+10,AcctCur(),C'150,150,190',7,"Arial Bold",ANCHOR_RIGHT_UPPER);
 
@@ -2435,7 +2445,7 @@ int OnInit()
    // Exportar estado inicial
    ExportStateToFile();
 
-   Print("EA v5.50 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),"% de ",RiskBaseLabel(),
+   Print("EA v5.51 TP FIJO (sin trailing) | Riesgo ",RiskPercentText(),"% de ",RiskBaseLabel(),
          " = ",DoubleToString(RiskUSD,2)," ",AcctCur()," por op",
          " | SL división ", DoubleToString(RiskDivPoints,0), " pts -> lote ", DoubleToString(g_Lots,2),
          " | SL orden ", DoubleToString(SL_Points,0), " pts | TP ", DoubleToString(TP_Points,0), " pts",
